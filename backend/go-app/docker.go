@@ -4,6 +4,7 @@ package main
 import (
 	"archive/tar"
 	"path/filepath"
+	"shuffle/model"
 
 	"bytes"
 	"context"
@@ -397,8 +398,7 @@ func handleStopHookDocker(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	hook, err := getHook(ctx, fileId)
+	hook, err := getHook(fileId)
 	if err != nil {
 		log.Printf("Failed getting hook: %s", err)
 		resp.WriteHeader(401)
@@ -418,8 +418,8 @@ func handleStopHookDocker(resp http.ResponseWriter, request *http.Request) {
 
 	hook.Status = "stopped"
 	hook.Running = false
-	hook.Actions = []HookAction{}
-	err = setHook(ctx, *hook)
+	hook.Actions = []model.HookAction{}
+	err = setHook(*hook)
 	if err != nil {
 		log.Printf("Failed setting hook: %s", err)
 		resp.WriteHeader(401)
@@ -457,7 +457,6 @@ var webhook = `{
 
 // Starts a new webhook
 func handleDeleteHookDocker(resp http.ResponseWriter, request *http.Request) {
-	ctx := context.Background()
 	cors := handleCors(resp, request)
 	if cors {
 		return
@@ -482,7 +481,13 @@ func handleDeleteHookDocker(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	err := DeleteKey(ctx, "hooks", fileId)
+	hook, err := getHook(fileId)
+	if err != nil {
+		resp.WriteHeader(401)
+		resp.Write([]byte(`{"success": false, "message": "Can't delete"}`))
+		return
+	}
+	err = dbClient.DeleteStruct(&hook)
 	if err != nil {
 		resp.WriteHeader(401)
 		resp.Write([]byte(`{"success": false, "message": "Can't delete"}`))
@@ -529,8 +534,7 @@ func handleStartHookDocker(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	hook, err := getHook(ctx, fileId)
+	hook, err := getHook(fileId)
 	if err != nil {
 		log.Printf("Failed getting hook: %s", err)
 		resp.WriteHeader(401)
@@ -588,7 +592,7 @@ func handleStartHookDocker(resp http.ResponseWriter, request *http.Request) {
 	if hook.Type == "webhook" {
 		hook.Info.Url = fmt.Sprintf("%s:%s%s", baseUrl, port, filepath)
 	}
-	err = setHook(ctx, *hook)
+	err = setHook(*hook)
 	if err != nil {
 		log.Printf("Failed setting hook: %s", err)
 		resp.WriteHeader(401)
@@ -619,7 +623,7 @@ func handleStartHookDocker(resp http.ResponseWriter, request *http.Request) {
 }
 
 func hookTest() {
-	var hook Hook
+	var hook model.Hook
 	err := json.Unmarshal([]byte(webhook), &hook)
 	log.Println(webhook)
 	if err != nil {
@@ -627,13 +631,12 @@ func hookTest() {
 		return
 	}
 
-	ctx := context.Background()
-	err = setHook(ctx, hook)
+	err = setHook(hook)
 	if err != nil {
 		log.Printf("Failed setting hook: %s", err)
 	}
 
-	returnHook, err := getHook(ctx, hook.Id)
+	returnHook, err := getHook(hook.Id)
 	if err != nil {
 		log.Printf("Failed getting hook: %s", err)
 	}

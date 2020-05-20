@@ -6,16 +6,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/asdine/storm/v3"
+	"github.com/asdine/storm/v3/q"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"shuffle/model"
 	"strconv"
 	"strings"
 	"time"
 
-	"cloud.google.com/go/datastore"
 	"cloud.google.com/go/scheduler/apiv1"
 	gyaml "github.com/ghodss/yaml"
 	"github.com/h2non/filetype"
@@ -37,16 +39,12 @@ import (
 )
 
 var localBase = "http://localhost:5001"
-var baseEnvironment = "onprem"
 
 var cloudname = "cloud"
 
 var defaultLocation = "europe-west2"
 var scheduledJobs = map[string]*newscheduler.Job{}
 
-// To test out firestore before potential merge
-var shuffleTestProject = "shuffle-test-258209"
-var shuffleTestPath = "./shuffle-test-258209-5a2e8d7e508a.json"
 
 //var upgrader = websocket.Upgrader{
 //	ReadBufferSize:  1024,
@@ -56,268 +54,34 @@ var shuffleTestPath = "./shuffle-test-258209-5a2e8d7e508a.json"
 //	},
 //}
 
-type ExecutionRequest struct {
-	ExecutionId       string   `json:"execution_id"`
-	ExecutionArgument string   `json:"execution_argument"`
-	WorkflowId        string   `json:"workflow_id"`
-	Environments      []string `json:"environments"`
-	Authorization     string   `json:"authorization"`
-	Status            string   `json:"status"`
-	Start             string   `json:"start"`
-	Type              string   `json:"type"`
-}
-
-type Org struct {
-	Name  string `json:"name"`
-	Org   string `json:"org"`
-	Users []User `json:"users"`
-	Id    string `json:"id"`
-}
-
-type WorkflowApp struct {
-	Name        string `json:"name" yaml:"name" required:true datastore:"name"`
-	IsValid     bool   `json:"is_valid" yaml:"is_valid" required:true datastore:"is_valid"`
-	ID          string `json:"id" yaml:"id,omitempty" required:false datastore:"id"`
-	Link        string `json:"link" yaml:"link" required:false datastore:"link,noindex"`
-	AppVersion  string `json:"app_version" yaml:"app_version" required:true datastore:"app_version"`
-	Generated   bool   `json:"generated" yaml:"generated" required:false datastore:"generated"`
-	Downloaded  bool   `json:"downloaded" yaml:"downloaded" required:false datastore:"downloaded"`
-	Sharing     bool   `json:"sharing" yaml:"sharing" required:false datastore:"sharing"`
-	Verified    bool   `json:"verified" yaml:"verified" required:false datastore:"verified"`
-	Tested      bool   `json:"tested" yaml:"tested" required:false datastore:"tested"`
-	Owner       string `json:"owner" datastore:"owner" yaml:"owner"`
-	PrivateID   string `json:"private_id" yaml:"private_id" required:false datastore:"private_id"`
-	Description string `json:"description" datastore:"description" required:false yaml:"description"`
-	Environment string `json:"environment" datastore:"environment" required:true yaml:"environment"`
-	SmallImage  string `json:"small_image" datastore:"small_image,noindex" required:false yaml:"small_image"`
-	LargeImage  string `json:"large_image" datastore:"large_image,noindex" yaml:"large_image" required:false`
-	ContactInfo struct {
-		Name string `json:"name" datastore:"name" yaml:"name"`
-		Url  string `json:"url" datastore:"url" yaml:"url"`
-	} `json:"contact_info" datastore:"contact_info" yaml:"contact_info" required:false`
-	Actions        []WorkflowAppAction `json:"actions" yaml:"actions" required:true datastore:"actions"`
-	Authentication Authentication      `json:"authentication" yaml:"authentication" required:false datastore:"authentication"`
-}
-
-type WorkflowAppActionParameter struct {
-	Description string           `json:"description" datastore:"description" yaml:"description"`
-	ID          string           `json:"id" datastore:"id" yaml:"id,omitempty"`
-	Name        string           `json:"name" datastore:"name" yaml:"name"`
-	Example     string           `json:"example" datastore:"example" yaml:"example"`
-	Value       string           `json:"value" datastore:"value" yaml:"value,omitempty"`
-	Multiline   bool             `json:"multiline" datastore:"multiline" yaml:"multiline"`
-	ActionField string           `json:"action_field" datastore:"action_field" yaml:"actionfield,omitempty"`
-	Variant     string           `json:"variant" datastore:"variant" yaml:"variant,omitempty"`
-	Required    bool             `json:"required" datastore:"required" yaml:"required"`
-	Schema      SchemaDefinition `json:"schema" datastore:"schema" yaml:"schema"`
-}
-
-type SchemaDefinition struct {
-	Type string `json:"type" datastore:"type"`
-}
-
-type WorkflowAppAction struct {
-	Description    string                       `json:"description" datastore:"description"`
-	ID             string                       `json:"id" datastore:"id" yaml:"id,omitempty"`
-	Name           string                       `json:"name" datastore:"name"`
-	Label          string                       `json:"label" datastore:"label"`
-	NodeType       string                       `json:"node_type" datastore:"node_type"`
-	Environment    string                       `json:"environment" datastore:"environment"`
-	Sharing        bool                         `json:"sharing" datastore:"sharing"`
-	PrivateID      string                       `json:"private_id" datastore:"private_id"`
-	AppID          string                       `json:"app_id" datastore:"app_id"`
-	Authentication []AuthenticationStore        `json:"authentication" datastore:"authentication" yaml:"authentication,omitempty"`
-	Tested         bool                         `json:"tested" datastore:"tested" yaml:"tested"`
-	Parameters     []WorkflowAppActionParameter `json:"parameters" datastore: "parameters"`
-	Returns        struct {
-		Description string           `json:"description" datastore:"returns" yaml:"description,omitempty"`
-		ID          string           `json:"id" datastore:"id" yaml:"id,omitempty"`
-		Schema      SchemaDefinition `json:"schema" datastore:"schema" yaml:"schema"`
-	} `json:"returns" datastore:"returns"`
-}
-
-// FIXME: Generate a callback authentication ID?
-type WorkflowExecution struct {
-	Type              string         `json:"type" datastore:"type"`
-	Status            string         `json:"status" datastore:"status"`
-	Start             string         `json:"start" datastore:"start"`
-	ExecutionArgument string         `json:"execution_argument" datastore:"execution_argument"`
-	ExecutionId       string         `json:"execution_id" datastore:"execution_id"`
-	WorkflowId        string         `json:"workflow_id" datastore:"workflow_id"`
-	LastNode          string         `json:"last_node" datastore:"last_node"`
-	Authorization     string         `json:"authorization" datastore:"authorization"`
-	Result            string         `json:"result" datastore:"result,noindex"`
-	StartedAt         int64          `json:"started_at" datastore:"started_at"`
-	CompletedAt       int64          `json:"completed_at" datastore:"completed_at"`
-	ProjectId         string         `json:"project_id" datastore:"project_id"`
-	Locations         []string       `json:"locations" datastore:"locations"`
-	Workflow          Workflow       `json:"workflow" datastore:"workflow,noindex"`
-	Results           []ActionResult `json:"results" datastore:"results,noindex"`
-}
-
-// Added environment for location to execute
-type Action struct {
-	AppName     string                       `json:"app_name" datastore:"app_name"`
-	AppVersion  string                       `json:"app_version" datastore:"app_version"`
-	AppID       string                       `json:"app_id" datastore:"app_id"`
-	Errors      []string                     `json:"errors" datastore:"errors"`
-	ID          string                       `json:"id" datastore:"id"`
-	IsValid     bool                         `json:"is_valid" datastore:"is_valid"`
-	IsStartNode bool                         `json:"isStartNode" datastore:"isStartNode"`
-	Sharing     bool                         `json:"sharing" datastore:"sharing"`
-	PrivateID   string                       `json:"private_id" datastore:"private_id"`
-	Label       string                       `json:"label" datastore:"label"`
-	SmallImage  string                       `json:"small_image" datastore:"small_image,noindex" required:false yaml:"small_image"`
-	LargeImage  string                       `json:"large_image" datastore:"large_image,noindex" yaml:"large_image" required:false`
-	Environment string                       `json:"environment" datastore:"environment"`
-	Name        string                       `json:"name" datastore:"name"`
-	Parameters  []WorkflowAppActionParameter `json:"parameters" datastore: "parameters,noindex"`
-	Position    struct {
-		X float64 `json:"x" datastore:"x"`
-		Y float64 `json:"y" datastore:"y"`
-	} `json:"position"`
-	Priority int `json:"priority" datastore:"priority"`
-}
-
-// Added environment for location to execute
-type Trigger struct {
-	AppName         string                       `json:"app_name" datastore:"app_name"`
-	Description     string                       `json:"description" datastore:"description"`
-	LongDescription string                       `json:"long_description" datastore:"long_description"`
-	Status          string                       `json:"status" datastore:"status"`
-	AppVersion      string                       `json:"app_version" datastore:"app_version"`
-	Errors          []string                     `json:"errors" datastore:"errors"`
-	ID              string                       `json:"id" datastore:"id"`
-	IsValid         bool                         `json:"is_valid" datastore:"is_valid"`
-	IsStartNode     bool                         `json:"isStartNode" datastore:"isStartNode"`
-	Label           string                       `json:"label" datastore:"label"`
-	SmallImage      string                       `json:"small_image" datastore:"small_image,noindex" required:false yaml:"small_image"`
-	LargeImage      string                       `json:"large_image" datastore:"large_image,noindex" yaml:"large_image" required:false`
-	Environment     string                       `json:"environment" datastore:"environment"`
-	TriggerType     string                       `json:"trigger_type" datastore:"trigger_type"`
-	Name            string                       `json:"name" datastore:"name"`
-	Parameters      []WorkflowAppActionParameter `json:"parameters" datastore: "parameters,noindex"`
-	Position        struct {
-		X float64 `json:"x" datastore:"x"`
-		Y float64 `json:"y" datastore:"y"`
-	} `json:"position"`
-	Priority int `json:"priority" datastore:"priority"`
-}
-
-type Branch struct {
-	DestinationID string      `json:"destination_id" datastore:"destination_id"`
-	ID            string      `json:"id" datastore:"id"`
-	SourceID      string      `json:"source_id" datastore:"source_id"`
-	Label         string      `json:"label" datastore:"label"`
-	HasError      bool        `json:"has_errors" datastore: "has_errors"`
-	Conditions    []Condition `json:"conditions" datastore: "conditions"`
-}
-
-// Same format for a lot of stuff
-type Condition struct {
-	Condition   WorkflowAppActionParameter `json:"condition" datastore:"condition"`
-	Source      WorkflowAppActionParameter `json:"source" datastore:"source"`
-	Destination WorkflowAppActionParameter `json:"destination" datastore:"destination"`
-}
-
-type Schedule struct {
-	Name              string `json:"name" datastore:"name"`
-	Frequency         string `json:"frequency" datastore:"frequency"`
-	ExecutionArgument string `json:"execution_argument" datastore:"execution_argument"`
-	Id                string `json:"id" datastore:"id"`
-}
-
-type Workflow struct {
-	Actions           []Action   `json:"actions" datastore:"actions,noindex"`
-	Branches          []Branch   `json:"branches" datastore:"branches,noindex"`
-	Triggers          []Trigger  `json:"triggers" datastore:"triggers,noindex"`
-	Schedules         []Schedule `json:"schedules" datastore:"schedules,noindex"`
-	Errors            []string   `json:"errors,omitempty" datastore:"errors"`
-	Tags              []string   `json:"tags,omitempty" datastore:"tags"`
-	ID                string     `json:"id" datastore:"id"`
-	IsValid           bool       `json:"is_valid" datastore:"is_valid"`
-	Name              string     `json:"name" datastore:"name"`
-	Description       string     `json:"description" datastore:"description"`
-	Start             string     `json:"start" datastore:"start"`
-	Owner             string     `json:"owner" datastore:"owner"`
-	Sharing           string     `json:"sharing" datastore:"sharing"`
-	Org               []Org      `json:"org,omitempty" datastore:"org"`
-	ExecutingOrg      Org        `json:"execution_org,omitempty" datastore:"execution_org"`
-	WorkflowVariables []struct {
-		Description string `json:"description" datastore:"description"`
-		ID          string `json:"id" datastore:"id"`
-		Name        string `json:"name" datastore:"name"`
-		Value       string `json:"value" datastore:"value"`
-	} `json:"workflow_variables" datastore:"workflow_variables"`
-}
-
-type ActionResult struct {
-	Action        Action `json:"action" datastore:"action"`
-	ExecutionId   string `json:"execution_id" datastore:"execution_id"`
-	Authorization string `json:"authorization" datastore:"authorization"`
-	Result        string `json:"result" datastore:"result,noindex"`
-	StartedAt     int64  `json:"started_at" datastore:"started_at"`
-	CompletedAt   int64  `json:"completed_at" datastore:"completed_at"`
-	Status        string `json:"status" datastore:"status"`
-}
-
-type Authentication struct {
-	Required   bool                   `json:"required" datastore:"required" yaml:"required" `
-	Parameters []AuthenticationParams `json:"parameters" datastore:"parameters" yaml:"parameters"`
-}
-
-type AuthenticationParams struct {
-	Description string `json:"description" datastore:"description" yaml:"description"`
-	ID          string `json:"id" datastore:"id" yaml:"id"`
-	Name        string `json:"name" datastore:"name" yaml:"name"`
-	Example     string `json:"example" datastore:"example" yaml:"example"`
-	Value       string `json:"value,omitempty" datastore:"value" yaml:"value"`
-	Multiline   bool   `json:"multiline" datastore:"multiline" yaml:"multiline"`
-	Required    bool   `json:"required" datastore:"required" yaml:"required"`
-	In          string `json:"in" datastore:"in" yaml:"in"`
-	Scheme      string `json:"scheme" datastore:"scheme" yaml:"scheme"`
-}
-
-type AuthenticationStore struct {
-	Key   string `json:"key" datastore:"key"`
-	Value string `json:"value" datastore:"value"`
-}
-
-type ExecutionRequestWrapper struct {
-	Data []ExecutionRequest `json:"data"`
-}
-
 // This might be... a bit off, but that's fine :)
 // This might also be stupid, as we want timelines and such
 // Anyway, these are super basic stupid stats.
-func increaseStatisticsField(ctx context.Context, fieldname, id string, amount int64) error {
+func increaseStatisticsField(fieldname, id string, amount int64) error {
 
 	// 1. Get current stats
 	// 2. Increase field(s)
 	// 3. Put new stats
-	statisticsId := "global_statistics"
-	nameKey := fieldname
-	key := datastore.NameKey(statisticsId, nameKey, nil)
 
-	statisticsItem := StatisticsItem{}
-	newData := StatisticsData{
+	statisticsItem := model.StatisticsItem{}
+	newData := model.StatisticsData{
 		Timestamp: int64(time.Now().Unix()),
 		Amount:    amount,
 		Id:        id,
 	}
 
-	if err := dbclient.Get(ctx, key, &statisticsItem); err != nil {
+	if err := dbClient.One("Fieldname", fieldname, &statisticsItem); err != nil {
 		// Should init
-		if strings.Contains(fmt.Sprintf("%s", err), "entity") {
-			statisticsItem = StatisticsItem{
+		if err == storm.ErrNotFound {
+			statisticsItem = model.StatisticsItem{
 				Total:     amount,
 				Fieldname: fieldname,
-				Data: []StatisticsData{
+				Data: []model.StatisticsData{
 					newData,
 				},
 			}
 
-			if _, err := dbclient.Put(ctx, key, &statisticsItem); err != nil {
+			if err := dbClient.Save(&statisticsItem); err != nil {
 				log.Printf("Error setting base stats: %s", err)
 				return err
 			}
@@ -333,7 +97,7 @@ func increaseStatisticsField(ctx context.Context, fieldname, id string, amount i
 	statisticsItem.Data = append(statisticsItem.Data, newData)
 
 	// New struct, to not add body, author etc
-	if _, err := dbclient.Put(ctx, key, &statisticsItem); err != nil {
+	if err := dbClient.Save(&statisticsItem); err != nil {
 		log.Printf("Error stats to %s: %s", fieldname, err)
 		return err
 	}
@@ -343,11 +107,10 @@ func increaseStatisticsField(ctx context.Context, fieldname, id string, amount i
 	return nil
 }
 
-func setWorkflowQueue(ctx context.Context, executionRequests ExecutionRequestWrapper, id string) error {
-	key := datastore.NameKey("workflowqueue", id, nil)
-
+func setWorkflowQueue(executionRequests model.ExecutionRequestWrapper, id string) error {
 	// New struct, to not add body, author etc
-	if _, err := dbclient.Put(ctx, key, &executionRequests); err != nil {
+	executionRequests.ID = id
+	if err := dbClient.Save(&executionRequests); err != nil {
 		log.Printf("Error adding workflow queue: %s", err)
 		return err
 	}
@@ -355,11 +118,11 @@ func setWorkflowQueue(ctx context.Context, executionRequests ExecutionRequestWra
 	return nil
 }
 
-func getWorkflowQueue(ctx context.Context, id string) (ExecutionRequestWrapper, error) {
-	key := datastore.NameKey("workflowqueue", id, nil)
-	workflows := ExecutionRequestWrapper{}
-	if err := dbclient.Get(ctx, key, &workflows); err != nil {
-		return ExecutionRequestWrapper{}, err
+func getWorkflowQueue(id string) (model.ExecutionRequestWrapper, error) {
+	workflows := model.ExecutionRequestWrapper{}
+
+	if err := dbClient.One("ID", id, &workflows); err != nil {
+		return model.ExecutionRequestWrapper{}, err
 	}
 
 	return workflows, nil
@@ -423,7 +186,7 @@ func createSchedule(ctx context.Context, scheduleId, workflowId, name, frequency
 			Body:   ioutil.NopCloser(strings.NewReader(string(body))),
 		}
 
-		_, _, err := handleExecution(workflowId, Workflow{}, request)
+		_, _, err := handleExecution(workflowId, model.Workflow{}, request)
 		if err != nil {
 			log.Printf("Failed to execute: %s", err)
 		}
@@ -441,7 +204,7 @@ func createSchedule(ctx context.Context, scheduleId, workflowId, name, frequency
 
 	// Doesn't need running/not running. If stopped, we just delete it.
 	timeNow := int64(time.Now().Unix())
-	schedule := ScheduleOld{
+	schedule := model.ScheduleOld{
 		Id:                   scheduleId,
 		WorkflowId:           workflowId,
 		Argument:             string(body),
@@ -451,7 +214,7 @@ func createSchedule(ctx context.Context, scheduleId, workflowId, name, frequency
 		LastRuntime:          timeNow,
 	}
 
-	err = setSchedule(ctx, schedule)
+	err = setSchedule(schedule)
 	if err != nil {
 		log.Printf("Failed to set schedule: %s", err)
 		return err
@@ -479,8 +242,7 @@ func handleGetWorkflowqueueConfirm(resp http.ResponseWriter, request *http.Reque
 	}
 
 	//setWorkflowqueuetest(id)
-	ctx := context.Background()
-	executionRequests, err := getWorkflowQueue(ctx, id)
+	executionRequests, err := getWorkflowQueue(id)
 	if err != nil {
 		log.Printf("(1) Failed reading body for workflowqueue: %s", err)
 		resp.WriteHeader(401)
@@ -505,7 +267,7 @@ func handleGetWorkflowqueueConfirm(resp http.ResponseWriter, request *http.Reque
 
 	// Getting from the request
 	//log.Println(string(body))
-	var removeExecutionRequests ExecutionRequestWrapper
+	var removeExecutionRequests model.ExecutionRequestWrapper
 	err = json.Unmarshal(body, &removeExecutionRequests)
 	if err != nil {
 		log.Printf("Failed executionrequest in queue unmarshaling: %s", err)
@@ -522,7 +284,7 @@ func handleGetWorkflowqueueConfirm(resp http.ResponseWriter, request *http.Reque
 	}
 
 	// remove items from DB
-	var newExecutionRequests ExecutionRequestWrapper
+	var newExecutionRequests model.ExecutionRequestWrapper
 	for _, execution := range executionRequests.Data {
 		found := false
 		for _, removeExecution := range removeExecutionRequests.Data {
@@ -539,7 +301,7 @@ func handleGetWorkflowqueueConfirm(resp http.ResponseWriter, request *http.Reque
 
 	// Push only the remaining to the DB (remove)
 	if len(executionRequests.Data) != len(newExecutionRequests.Data) {
-		err := setWorkflowQueue(ctx, newExecutionRequests, id)
+		err := setWorkflowQueue(newExecutionRequests, id)
 		if err != nil {
 			log.Printf("Fail: %s", err)
 		}
@@ -570,8 +332,7 @@ func handleGetWorkflowqueue(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	executionRequests, err := getWorkflowQueue(ctx, id)
+	executionRequests, err := getWorkflowQueue(id)
 	if err != nil {
 		// Skipping as this comes up over and over
 		//log.Printf("(2) Failed reading body for workflowqueue: %s", err)
@@ -581,7 +342,7 @@ func handleGetWorkflowqueue(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	if len(executionRequests.Data) == 0 {
-		executionRequests.Data = []ExecutionRequest{}
+		executionRequests.Data = []model.ExecutionRequest{}
 	}
 
 	newjson, err := json.Marshal(executionRequests)
@@ -609,7 +370,7 @@ func handleGetStreamResults(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	var actionResult ActionResult
+	var actionResult model.ActionResult
 	err = json.Unmarshal(body, &actionResult)
 	if err != nil {
 		log.Printf("Failed ActionResult unmarshaling: %s", err)
@@ -618,8 +379,7 @@ func handleGetStreamResults(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	workflowExecution, err := getWorkflowExecution(ctx, actionResult.ExecutionId)
+	workflowExecution, err := getWorkflowExecution(actionResult.ExecutionId)
 	if err != nil {
 		log.Printf("Failed getting execution (streamresult) %s: %s", actionResult.ExecutionId, err)
 		resp.WriteHeader(401)
@@ -665,7 +425,7 @@ func handleWorkflowQueue(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	var actionResult ActionResult
+	var actionResult model.ActionResult
 	err = json.Unmarshal(body, &actionResult)
 	if err != nil {
 		log.Printf("Failed ActionResult unmarshaling: %s", err)
@@ -677,11 +437,11 @@ func handleWorkflowQueue(resp http.ResponseWriter, request *http.Request) {
 	// 1. Get the WorkflowExecution(ExecutionId) from the database
 	// 2. if ActionResult.Authentication != WorkflowExecution.Authentication -> exit
 	// 3. Add to and update actionResult in workflowExecution
-	// 4. Push to db
+	// 4. Push to dbClient
 	// IF FAIL: Set executionstatus: abort or cancel
 
-	ctx := context.Background()
-	workflowExecution, err := getWorkflowExecution(ctx, actionResult.ExecutionId)
+
+	workflowExecution, err := getWorkflowExecution(actionResult.ExecutionId)
 	if err != nil {
 		log.Printf("Failed getting execution (workflowqueue) %s: %s", actionResult.ExecutionId, err)
 		resp.WriteHeader(401)
@@ -721,7 +481,7 @@ func handleWorkflowQueue(resp http.ResponseWriter, request *http.Request) {
 
 		// Cleans up aborted, and always gives a result
 		lastResult := ""
-		newResults := []ActionResult{}
+		newResults := []model.ActionResult{}
 		// type ActionResult struct {
 		for _, result := range workflowExecution.Results {
 			if result.Status == "EXECUTING" {
@@ -740,12 +500,12 @@ func handleWorkflowQueue(resp http.ResponseWriter, request *http.Request) {
 		workflowExecution.Results = newResults
 
 		if workflowExecution.Status == "ABORTED" {
-			err = increaseStatisticsField(ctx, "workflow_executions_aborted", workflowExecution.Workflow.ID, 1)
+			err = increaseStatisticsField("workflow_executions_aborted", workflowExecution.Workflow.ID, 1)
 			if err != nil {
 				log.Printf("Failed to increase aborted execution stats: %s", err)
 			}
 		} else if workflowExecution.Status == "FAILURE" {
-			err = increaseStatisticsField(ctx, "workflow_executions_failure", workflowExecution.Workflow.ID, 1)
+			err = increaseStatisticsField("workflow_executions_failure", workflowExecution.Workflow.ID, 1)
 			if err != nil {
 				log.Printf("Failed to increase failure execution stats: %s", err)
 			}
@@ -833,7 +593,7 @@ func handleWorkflowQueue(resp http.ResponseWriter, request *http.Request) {
 				workflowExecution.LastNode = actionResult.Action.ID
 			}
 
-			err = increaseStatisticsField(ctx, "workflow_executions_success", workflowExecution.Workflow.ID, 1)
+			err = increaseStatisticsField("workflow_executions_success", workflowExecution.Workflow.ID, 1)
 			if err != nil {
 				log.Printf("Failed to increase success execution stats: %s", err)
 			}
@@ -847,7 +607,7 @@ func handleWorkflowQueue(resp http.ResponseWriter, request *http.Request) {
 	//	log.Printf("Name: %s, Env: %s", action.Name, action.Environment)
 	//}
 
-	err = setWorkflowExecution(ctx, *workflowExecution)
+	err = setWorkflowExecution(*workflowExecution)
 	if err != nil {
 		log.Printf("Error saving workflow execution actionresult setting: %s", err)
 		resp.WriteHeader(401)
@@ -874,7 +634,6 @@ func getWorkflows(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	//memcacheName := fmt.Sprintf("%s_workflows", user.Username)
-	ctx := context.Background()
 	//if item, err := memcache.Get(ctx, memcacheName); err == memcache.ErrCacheMiss {
 	//	// Not in cache
 	//	//log.Printf("Workflows not in cache.")
@@ -888,9 +647,13 @@ func getWorkflows(resp http.ResponseWriter, request *http.Request) {
 	//}
 
 	// With user, do a search for workflows with user or user's org attached
-	q := datastore.NewQuery("workflow").Filter("owner =", user.Id)
-	var workflows []Workflow
-	_, err = dbclient.GetAll(ctx, q, &workflows)
+	var workflows []model.Workflow
+	err = dbClient.Find("Owner", user.Id, &workflows)
+	if err == storm.ErrNotFound {
+		resp.WriteHeader(200)
+		resp.Write([]byte("[]"))
+		return
+	}
 	if err != nil {
 		log.Printf("Failed getting workflows for user %s: %s", user.Username, err)
 		resp.WriteHeader(401)
@@ -953,7 +716,7 @@ func setNewWorkflow(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	var workflow Workflow
+	var workflow model.Workflow
 	err = json.Unmarshal(body, &workflow)
 	if err != nil {
 		log.Printf("Failed unmarshaling: %s", err)
@@ -966,8 +729,7 @@ func setNewWorkflow(resp http.ResponseWriter, request *http.Request) {
 	workflow.Owner = user.Id
 	workflow.Sharing = "private"
 
-	ctx := context.Background()
-	err = setWorkflow(ctx, workflow, workflow.ID)
+	err = setWorkflow(workflow, workflow.ID)
 	if err != nil {
 		log.Printf("Failed setting workflow: %s", err)
 		resp.WriteHeader(401)
@@ -976,25 +738,25 @@ func setNewWorkflow(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	log.Printf("Saved new workflow %s with name %s", workflow.ID, workflow.Name)
-	err = increaseStatisticsField(ctx, "total_workflows", workflow.ID, 1)
+	err = increaseStatisticsField("total_workflows", workflow.ID, 1)
 	if err != nil {
 		log.Printf("Failed to increase total workflows: %s", err)
 	}
 
 	if len(workflow.Actions) == 0 {
-		workflow.Actions = []Action{}
+		workflow.Actions = []model.Action{}
 	}
 	if len(workflow.Branches) == 0 {
-		workflow.Branches = []Branch{}
+		workflow.Branches = []model.Branch{}
 	}
 	if len(workflow.Triggers) == 0 {
-		workflow.Triggers = []Trigger{}
+		workflow.Triggers = []model.Trigger{}
 	}
 	if len(workflow.Errors) == 0 {
 		workflow.Errors = []string{}
 	}
 
-	newActions := []Action{}
+	newActions := []model.Action{}
 	for _, action := range workflow.Actions {
 		if action.Environment == "" {
 			//action.Environment = baseEnvironment
@@ -1056,8 +818,7 @@ func deleteWorkflow(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	workflow, err := getWorkflow(ctx, fileId)
+	workflow, err := getWorkflow(fileId)
 	if err != nil {
 		log.Printf("Failed getting the workflow locally: %s", err)
 		resp.WriteHeader(401)
@@ -1076,23 +837,23 @@ func deleteWorkflow(resp http.ResponseWriter, request *http.Request) {
 	// Clean up triggers and executions
 	for _, item := range workflow.Triggers {
 		if item.TriggerType == "SCHEDULE" {
-			err = deleteSchedule(ctx, item.ID)
+			err = deleteSchedule(item.ID)
 			if err != nil {
 				log.Printf("Failed to delete schedule: %s", err)
 			}
 		} else if item.TriggerType == "WEBHOOK" {
-			err = removeWebhookFunction(ctx, item.ID)
+			err = removeWebhookFunction(item.ID)
 			if err != nil {
 				log.Printf("Failed to delete webhook: %s", err)
 			}
 		} else if item.TriggerType == "EMAIL" {
-			err = handleOutlookSubRemoval(ctx, workflow.ID, item.ID)
+			err = handleOutlookSubRemoval(workflow.ID, item.ID)
 			if err != nil {
 				log.Printf("Failed to delete email sub: %s", err)
 			}
 		}
 
-		err = increaseStatisticsField(ctx, "total_workflow_triggers", workflow.ID, -1)
+		err = increaseStatisticsField("total_workflow_triggers", workflow.ID, -1)
 		if err != nil {
 			log.Printf("Failed to increase total workflows: %s", err)
 		}
@@ -1100,7 +861,7 @@ func deleteWorkflow(resp http.ResponseWriter, request *http.Request) {
 
 	// FIXME - maybe delete workflow executions
 	log.Printf("Should delete workflow %s", fileId)
-	err = DeleteKey(ctx, "workflow", fileId)
+	err = dbClient.DeleteStruct(workflow)
 	if err != nil {
 		log.Printf("Failed deleting key %s", fileId)
 		resp.WriteHeader(401)
@@ -1108,7 +869,7 @@ func deleteWorkflow(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	err = increaseStatisticsField(ctx, "total_workflows", fileId, -1)
+	err = increaseStatisticsField("total_workflows", fileId, -1)
 	if err != nil {
 		log.Printf("Failed to increase total workflows: %s", err)
 	}
@@ -1160,10 +921,9 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	// Here to check access rights
-	ctx := context.Background()
 	log.Println("GetWorkflow start")
 
-	tmpworkflow, err := getWorkflow(ctx, fileId)
+	tmpworkflow, err := getWorkflow(fileId)
 	if err != nil {
 		log.Printf("Failed getting the workflow locally: %s", err)
 		resp.WriteHeader(401)
@@ -1193,7 +953,7 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	log.Printf("Hello2")
-	var workflow Workflow
+	var workflow model.Workflow
 	err = json.Unmarshal([]byte(body), &workflow)
 	//log.Printf(string(body))
 	if err != nil {
@@ -1212,7 +972,7 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	// FIXME - this shouldn't be necessary with proper API checks
-	newActions := []Action{}
+	newActions := []model.Action{}
 	allNodes := []string{}
 	log.Println("Pre")
 	for _, action := range workflow.Actions {
@@ -1234,13 +994,13 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	if len(workflow.Actions) == 0 {
-		workflow.Actions = []Action{}
+		workflow.Actions = []model.Action{}
 	}
 	if len(workflow.Branches) == 0 {
-		workflow.Branches = []Branch{}
+		workflow.Branches = []model.Branch{}
 	}
 	if len(workflow.Triggers) == 0 {
-		workflow.Triggers = []Trigger{}
+		workflow.Triggers = []model.Trigger{}
 	}
 	if len(workflow.Errors) == 0 {
 		workflow.Errors = []string{}
@@ -1266,7 +1026,7 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 	if len(foundNodes) != len(allNodes) || len(workflow.Actions) <= 0 {
 		// This shit takes a few seconds lol
 		if !workflow.IsValid {
-			oldworkflow, err := getWorkflow(ctx, fileId)
+			oldworkflow, err := getWorkflow(fileId)
 			if err != nil {
 				log.Printf("Workflow %s doesn't exist - oldworkflow.", fileId)
 				resp.WriteHeader(401)
@@ -1275,7 +1035,7 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 			}
 
 			oldworkflow.IsValid = false
-			err = setWorkflow(ctx, *oldworkflow, fileId)
+			err = setWorkflow(*oldworkflow, fileId)
 			if err != nil {
 				log.Printf("Failed saving workflow to database: %s", err)
 				resp.WriteHeader(401)
@@ -1303,12 +1063,12 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 	// doesn't check sharing=true
 	// Have to do it like this to add the user's apps
 	log.Println("Apps set starting")
-	workflowApps := []WorkflowApp{}
+	workflowApps := []model.WorkflowApp{}
 	//memcacheName = "all_apps"
 	//if item, err := memcache.Get(ctx, memcacheName); err == memcache.ErrCacheMiss {
 	//	// Not in cache
 	//	log.Printf("Apps not in cache.")
-	workflowApps, err = getAllWorkflowApps(ctx)
+	workflowApps, err = getAllWorkflowApps()
 	if err != nil {
 		log.Printf("Failed getting all workflow apps from database: %s", err)
 		resp.WriteHeader(401)
@@ -1336,7 +1096,7 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 	log.Println("Apps set done")
 
 	// Check every app action and param to see whether they exist
-	newActions = []Action{}
+	newActions = []model.Action{}
 	for _, action := range workflow.Actions {
 		reservedApps := []string{
 			"0ca8887e-b4af-4e3e-887c-87e9d3bc3d3e",
@@ -1353,7 +1113,7 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 		if builtin {
 			newActions = append(newActions, action)
 		} else {
-			curapp := WorkflowApp{}
+			curapp := model.WorkflowApp{}
 			// FIXME - can this work with ONLY AppID?
 			for _, app := range workflowApps {
 				if app.ID == action.AppID {
@@ -1376,7 +1136,7 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 			}
 
 			// Check tosee if the appaction is valid
-			curappaction := WorkflowAppAction{}
+			curappaction := model.WorkflowAppAction{}
 			for _, curAction := range curapp.Actions {
 				if action.Name == curAction.Name {
 					curappaction = curAction
@@ -1396,7 +1156,7 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 			// FIXME - check all parameters to see if they're valid
 			// Includes checking required fields
 
-			newParams := []WorkflowAppActionParameter{}
+			newParams := []model.WorkflowAppActionParameter{}
 			for _, param := range curappaction.Parameters {
 				found := false
 
@@ -1439,7 +1199,7 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 	workflow.Actions = newActions
 	workflow.IsValid = true
 
-	err = setWorkflow(ctx, workflow, fileId)
+	err = setWorkflow(workflow, fileId)
 	if err != nil {
 		log.Printf("Failed saving workflow to database: %s", err)
 		resp.WriteHeader(401)
@@ -1449,7 +1209,7 @@ func saveWorkflow(resp http.ResponseWriter, request *http.Request) {
 
 	totalOldActions := len(tmpworkflow.Actions)
 	totalNewActions := len(workflow.Actions)
-	err = increaseStatisticsField(ctx, "total_workflow_actions", workflow.ID, int64(totalNewActions-totalOldActions))
+	err = increaseStatisticsField("total_workflow_actions", workflow.ID, int64(totalNewActions-totalOldActions))
 	if err != nil {
 		log.Printf("Failed to change total actions data: %s", err)
 	}
@@ -1534,8 +1294,7 @@ func abortExecution(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	workflowExecution, err := getWorkflowExecution(ctx, executionId)
+	workflowExecution, err := getWorkflowExecution(executionId)
 	if err != nil {
 		log.Printf("Failed getting execution (abort) %s: %s", executionId, err)
 		resp.WriteHeader(401)
@@ -1564,7 +1323,7 @@ func abortExecution(resp http.ResponseWriter, request *http.Request) {
 	workflowExecution.Status = "ABORTED"
 
 	lastResult := ""
-	newResults := []ActionResult{}
+	newResults := []model.ActionResult{}
 	// type ActionResult struct {
 	for _, result := range workflowExecution.Results {
 		if result.Status == "EXECUTING" {
@@ -1584,7 +1343,7 @@ func abortExecution(resp http.ResponseWriter, request *http.Request) {
 		workflowExecution.Result = lastResult
 	}
 
-	err = setWorkflowExecution(ctx, *workflowExecution)
+	err = setWorkflowExecution(*workflowExecution)
 	if err != nil {
 		log.Printf("Error saving workflow execution for updates when aborting %s: %s", topic, err)
 		resp.WriteHeader(401)
@@ -1592,7 +1351,7 @@ func abortExecution(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	err = increaseStatisticsField(ctx, "workflow_executions_aborted", workflowExecution.Workflow.ID, 1)
+	err = increaseStatisticsField("workflow_executions_aborted", workflowExecution.Workflow.ID, 1)
 	if err != nil {
 		log.Printf("Failed to increase aborted execution stats: %s", err)
 	}
@@ -1635,13 +1394,11 @@ func cleanupExecutions(resp http.ResponseWriter, request *http.Request) {
 	log.Printf("CLEANUP!")
 	log.Printf("%#v", user)
 
-	ctx := context.Background()
 	// Removes three months from today
 	timestamp := int64(time.Now().AddDate(0, -2, 0).Unix())
 	log.Println(timestamp)
-	q := datastore.NewQuery("workflowexecution").Filter("started_at <", timestamp)
-	var workflowExecutions []WorkflowExecution
-	_, err = dbclient.GetAll(ctx, q, &workflowExecutions)
+	var workflowExecutions []model.WorkflowExecution
+	err = dbClient.Select(q.Lt("StartedAt", timestamp)).Find(&workflowExecutions)
 	if err != nil {
 		log.Printf("Error getting workflowexec: %s", err)
 		resp.WriteHeader(401)
@@ -1655,26 +1412,25 @@ func cleanupExecutions(resp http.ResponseWriter, request *http.Request) {
 	resp.Write([]byte("OK"))
 }
 
-func handleExecution(id string, workflow Workflow, request *http.Request) (WorkflowExecution, string, error) {
-	ctx := context.Background()
+func handleExecution(id string, workflow model.Workflow, request *http.Request) (model.WorkflowExecution, string, error) {
 	if workflow.ID == "" || workflow.ID != id {
-		tmpworkflow, err := getWorkflow(ctx, id)
+		tmpworkflow, err := getWorkflow(id)
 		if err != nil {
 			log.Printf("Failed getting the workflow locally: %s", err)
-			return WorkflowExecution{}, "Failed getting workflow", err
+			return model.WorkflowExecution{}, "Failed getting workflow", err
 		}
 
 		workflow = *tmpworkflow
 	}
 
 	if len(workflow.Actions) == 0 {
-		workflow.Actions = []Action{}
+		workflow.Actions = []model.Action{}
 	}
 	if len(workflow.Branches) == 0 {
-		workflow.Branches = []Branch{}
+		workflow.Branches = []model.Branch{}
 	}
 	if len(workflow.Triggers) == 0 {
-		workflow.Triggers = []Trigger{}
+		workflow.Triggers = []model.Trigger{}
 	}
 	if len(workflow.Errors) == 0 {
 		workflow.Errors = []string{}
@@ -1682,21 +1438,21 @@ func handleExecution(id string, workflow Workflow, request *http.Request) (Workf
 
 	if !workflow.IsValid {
 		log.Printf("Stopped execution as workflow %s is not valid.", workflow.ID)
-		return WorkflowExecution{}, fmt.Sprintf(`workflow %s is invalid`, workflow.ID), errors.New("Failed getting workflow")
+		return model.WorkflowExecution{}, fmt.Sprintf(`workflow %s is invalid`, workflow.ID), errors.New("Failed getting workflow")
 	}
 
 	workflowBytes, err := json.Marshal(workflow)
 	if err != nil {
 		log.Printf("Failed workflow unmarshal in execution: %s", err)
-		return WorkflowExecution{}, "", err
+		return model.WorkflowExecution{}, "", err
 	}
 
 	//log.Println(workflow)
-	var workflowExecution WorkflowExecution
+	var workflowExecution model.WorkflowExecution
 	err = json.Unmarshal(workflowBytes, &workflowExecution.Workflow)
 	if err != nil {
 		log.Printf("Failed execution unmarshaling: %s", err)
-		return WorkflowExecution{}, "Failed unmarshal during execution", err
+		return model.WorkflowExecution{}, "Failed unmarshal during execution", err
 	}
 
 	makeNew := true
@@ -1704,15 +1460,14 @@ func handleExecution(id string, workflow Workflow, request *http.Request) (Workf
 		body, err := ioutil.ReadAll(request.Body)
 		if err != nil {
 			log.Printf("Failed request POST read: %s", err)
-			return WorkflowExecution{}, "Failed getting body", err
+			return model.WorkflowExecution{}, "Failed getting body", err
 		}
 
-		// This one doesn't really matter.
-		var execution ExecutionRequest
+		var execution model.ExecutionRequest
 		err = json.Unmarshal(body, &execution)
 		if err != nil {
-			//log.Printf("Failed execution POST unmarshaling - still continue: %s", err)
-			//return WorkflowExecution{}, "", err
+			log.Printf("Failed execution POST unmarshaling: %s", err)
+			return model.WorkflowExecution{}, "", err
 		}
 
 		if execution.Start == "" && len(body) > 0 {
@@ -1748,18 +1503,18 @@ func handleExecution(id string, workflow Workflow, request *http.Request) (Workf
 				log.Printf("Should update reference and return, no need for further execution!")
 
 				// Get the reference execution
-				oldExecution, err := getWorkflowExecution(ctx, referenceId[0])
+				oldExecution, err := getWorkflowExecution(referenceId[0])
 				if err != nil {
 					log.Printf("Failed getting execution (execution) %s: %s", referenceId[0], err)
-					return WorkflowExecution{}, fmt.Sprintf("Failed getting execution ID %s because it doesn't exist.", referenceId[0]), err
+					return model.WorkflowExecution{}, fmt.Sprintf("Failed getting execution ID %s because it doesn't exist.", referenceId[0]), err
 				}
 
 				if oldExecution.Workflow.ID != id {
 					log.Println("Wrong workflowid!")
-					return WorkflowExecution{}, fmt.Sprintf("Bad ID %s", referenceId), errors.New("Bad ID")
+					return model.WorkflowExecution{}, fmt.Sprintf("Bad ID %s", referenceId), errors.New("Bad ID")
 				}
 
-				newResults := []ActionResult{}
+				newResults := []model.ActionResult{}
 				//log.Printf("%#v", oldExecution.Results)
 				for _, result := range oldExecution.Results {
 					log.Printf("%s - %s", result.Action.ID, start[0])
@@ -1783,23 +1538,23 @@ func handleExecution(id string, workflow Workflow, request *http.Request) (Workf
 				}
 
 				oldExecution.Results = newResults
-				err = setWorkflowExecution(ctx, *oldExecution)
+				err = setWorkflowExecution(*oldExecution)
 				if err != nil {
 					log.Printf("Error saving workflow execution actionresult setting: %s", err)
-					return WorkflowExecution{}, fmt.Sprintf("Failed setting workflowexecution actionresult in execution: %s", err), err
+					return model.WorkflowExecution{}, fmt.Sprintf("Failed setting workflowexecution actionresult in execution: %s", err), err
 				}
 
-				return WorkflowExecution{}, "", nil
+				return model.WorkflowExecution{}, "", nil
 			}
 		}
 
 		if referenceok {
 			log.Printf("Handling an old execution continuation!")
 			// Will use the old name, but still continue with NEW ID
-			oldExecution, err := getWorkflowExecution(ctx, referenceId[0])
+			oldExecution, err := getWorkflowExecution(referenceId[0])
 			if err != nil {
 				log.Printf("Failed getting execution (execution) %s: %s", referenceId[0], err)
-				return WorkflowExecution{}, fmt.Sprintf("Failed getting execution ID %s because it doesn't exist.", referenceId[0]), err
+				return model.WorkflowExecution{}, fmt.Sprintf("Failed getting execution ID %s because it doesn't exist.", referenceId[0]), err
 			}
 
 			workflowExecution = *oldExecution
@@ -1824,7 +1579,7 @@ func handleExecution(id string, workflow Workflow, request *http.Request) (Workf
 	// FIXME - regex uuid, and check if already exists?
 	if len(workflowExecution.ExecutionId) != 36 {
 		log.Printf("Invalid uuid: %s", workflowExecution.ExecutionId)
-		return WorkflowExecution{}, "Invalid uuid", err
+		return model.WorkflowExecution{}, "Invalid uuid", err
 	}
 
 	// FIXME - find owner of workflow
@@ -1867,13 +1622,13 @@ func handleExecution(id string, workflow Workflow, request *http.Request) (Workf
 	//log.Println(string(mappedData))
 	topic := "workflows"
 	// FIXME - remove this?
-	newActions := []Action{}
+	newActions := []model.Action{}
 	for _, action := range workflowExecution.Workflow.Actions {
 		action.LargeImage = ""
 		//log.Println(action.Environment)
 
 		if action.Environment == "" {
-			return WorkflowExecution{}, fmt.Sprintf("Environment is not defined for %s", action.Name), errors.New("Environment not defined!")
+			return model.WorkflowExecution{}, fmt.Sprintf("Environment is not defined for %s", action.Name), errors.New("Environment not defined!")
 		}
 		newActions = append(newActions, action)
 	}
@@ -1902,10 +1657,10 @@ func handleExecution(id string, workflow Workflow, request *http.Request) (Workf
 		}
 	}
 
-	err = setWorkflowExecution(ctx, workflowExecution)
+	err = setWorkflowExecution(workflowExecution)
 	if err != nil {
 		log.Printf("Error saving workflow execution for updates %s: %s", topic, err)
-		return WorkflowExecution{}, "Failed getting workflowexecution", err
+		return model.WorkflowExecution{}, "Failed getting workflowexecution", err
 	}
 
 	// Adds queue for onprem execution
@@ -1915,17 +1670,17 @@ func handleExecution(id string, workflow Workflow, request *http.Request) (Workf
 		for _, environment := range environments {
 			log.Printf("EXECUTION: %s should execute onprem with execution environment \"%s\"", workflowExecution.ExecutionId, environment)
 
-			executionRequest := ExecutionRequest{
+			executionRequest := model.ExecutionRequest{
 				ExecutionId:   workflowExecution.ExecutionId,
 				WorkflowId:    workflowExecution.Workflow.ID,
 				Authorization: workflowExecution.Authorization,
 				Environments:  environments,
 			}
 
-			executionRequestWrapper, err := getWorkflowQueue(ctx, environment)
+			executionRequestWrapper, err := getWorkflowQueue(environment)
 			if err != nil {
-				executionRequestWrapper = ExecutionRequestWrapper{
-					Data: []ExecutionRequest{executionRequest},
+				executionRequestWrapper = model.ExecutionRequestWrapper{
+					Data: []model.ExecutionRequest{executionRequest},
 				}
 			} else {
 				executionRequestWrapper.Data = append(executionRequestWrapper.Data, executionRequest)
@@ -1933,14 +1688,14 @@ func handleExecution(id string, workflow Workflow, request *http.Request) (Workf
 
 			//log.Printf("Execution request: %#v", executionRequest)
 
-			err = setWorkflowQueue(ctx, executionRequestWrapper, environment)
+			err = setWorkflowQueue(executionRequestWrapper, environment)
 			if err != nil {
-				log.Printf("Failed adding to db: %s", err)
+				log.Printf("Failed adding to dbClient: %s", err)
 			}
 		}
 	}
 
-	err = increaseStatisticsField(ctx, "workflow_executions", workflow.ID, 1)
+	err = increaseStatisticsField("workflow_executions", workflow.ID, 1)
 	if err != nil {
 		log.Printf("Failed to increase stats execution stats: %s", err)
 	}
@@ -1982,8 +1737,7 @@ func executeWorkflow(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	//memcacheName := fmt.Sprintf("%s_%s", user.Username, fileId)
-	ctx := context.Background()
-	workflow, err := getWorkflow(ctx, fileId)
+	workflow, err := getWorkflow(fileId)
 	if err != nil {
 		log.Printf("Failed getting the workflow locally: %s", err)
 		resp.WriteHeader(401)
@@ -2053,8 +1807,7 @@ func stopSchedule(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	workflow, err := getWorkflow(ctx, fileId)
+	workflow, err := getWorkflow(fileId)
 	if err != nil {
 		log.Printf("Failed getting the workflow locally: %s", err)
 		resp.WriteHeader(401)
@@ -2072,19 +1825,19 @@ func stopSchedule(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	if len(workflow.Actions) == 0 {
-		workflow.Actions = []Action{}
+		workflow.Actions = []model.Action{}
 	}
 	if len(workflow.Branches) == 0 {
-		workflow.Branches = []Branch{}
+		workflow.Branches = []model.Branch{}
 	}
 	if len(workflow.Triggers) == 0 {
-		workflow.Triggers = []Trigger{}
+		workflow.Triggers = []model.Trigger{}
 	}
 	if len(workflow.Errors) == 0 {
 		workflow.Errors = []string{}
 	}
 
-	err = deleteSchedule(ctx, scheduleId)
+	err = deleteSchedule(scheduleId)
 	if err != nil {
 		if strings.Contains(err.Error(), "Job not found") {
 			resp.WriteHeader(200)
@@ -2142,8 +1895,7 @@ func stopScheduleGCP(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	workflow, err := getWorkflow(ctx, fileId)
+	workflow, err := getWorkflow(fileId)
 	if err != nil {
 		log.Printf("Failed getting the workflow locally: %s", err)
 		resp.WriteHeader(401)
@@ -2161,19 +1913,19 @@ func stopScheduleGCP(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	if len(workflow.Actions) == 0 {
-		workflow.Actions = []Action{}
+		workflow.Actions = []model.Action{}
 	}
 	if len(workflow.Branches) == 0 {
-		workflow.Branches = []Branch{}
+		workflow.Branches = []model.Branch{}
 	}
 	if len(workflow.Triggers) == 0 {
-		workflow.Triggers = []Trigger{}
+		workflow.Triggers = []model.Trigger{}
 	}
 	if len(workflow.Errors) == 0 {
 		workflow.Errors = []string{}
 	}
 
-	err = deleteSchedule(ctx, scheduleId)
+	err = deleteSchedule(scheduleId)
 	if err != nil {
 		if strings.Contains(err.Error(), "Job not found") {
 			resp.WriteHeader(200)
@@ -2190,7 +1942,7 @@ func stopScheduleGCP(resp http.ResponseWriter, request *http.Request) {
 	return
 }
 
-func deleteSchedule(ctx context.Context, id string) error {
+func deleteSchedule(id string) error {
 	log.Printf("Should stop schedule %s!", id)
 	//newscheduler "github.com/carlescere/scheduler"
 	log.Printf("Schedules: %#v", scheduledJobs)
@@ -2198,7 +1950,12 @@ func deleteSchedule(ctx context.Context, id string) error {
 		log.Printf("STOP THIS ONE: %s", value)
 		// Looks like this does the trick? Hurr
 		value.Lock()
-		err := DeleteKey(ctx, "schedules", id)
+		schedule, err := getSchedule(id)
+		if err != nil {
+			log.Printf("Failed to fetch schedule to delete: %s", err)
+			return err
+		}
+		err = dbClient.DeleteStruct(schedule)
 		if err != nil {
 			log.Printf("Failed to delete schedule: %s", err)
 			return err
@@ -2265,7 +2022,7 @@ func scheduleWorkflow(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	ctx := context.Background()
-	workflow, err := getWorkflow(ctx, fileId)
+	workflow, err := getWorkflow(fileId)
 	if err != nil {
 		log.Printf("Failed getting the workflow locally: %s", err)
 		resp.WriteHeader(401)
@@ -2283,13 +2040,13 @@ func scheduleWorkflow(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	if len(workflow.Actions) == 0 {
-		workflow.Actions = []Action{}
+		workflow.Actions = []model.Action{}
 	}
 	if len(workflow.Branches) == 0 {
-		workflow.Branches = []Branch{}
+		workflow.Branches = []model.Branch{}
 	}
 	if len(workflow.Triggers) == 0 {
-		workflow.Triggers = []Trigger{}
+		workflow.Triggers = []model.Trigger{}
 	}
 	if len(workflow.Errors) == 0 {
 		workflow.Errors = []string{}
@@ -2303,7 +2060,7 @@ func scheduleWorkflow(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	var schedule Schedule
+	var schedule model.Schedule
 	err = json.Unmarshal(body, &schedule)
 	if err != nil {
 		log.Printf("Failed schedule POST unmarshaling: %s", err)
@@ -2361,7 +2118,7 @@ func scheduleWorkflow(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	workflow.Schedules = append(workflow.Schedules, schedule)
-	err = setWorkflow(ctx, *workflow, workflow.ID)
+	err = setWorkflow(*workflow, workflow.ID)
 	if err != nil {
 		log.Printf("Failed setting workflow for schedule: %s", err)
 		resp.WriteHeader(401)
@@ -2412,7 +2169,6 @@ func getSpecificWorkflow(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
 	//memcacheName := fmt.Sprintf("%s_%s", user.Username, fileId)
 	//if item, err := memcache.Get(ctx, memcacheName); err == memcache.ErrCacheMiss {
 	//	// Not in cache
@@ -2427,7 +2183,7 @@ func getSpecificWorkflow(resp http.ResponseWriter, request *http.Request) {
 	//	return
 	//}
 
-	workflow, err := getWorkflow(ctx, fileId)
+	workflow, err := getWorkflow(fileId)
 	if err != nil {
 		log.Printf("Workflow %s doesn't exist.", fileId)
 		resp.WriteHeader(401)
@@ -2446,13 +2202,13 @@ func getSpecificWorkflow(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	if len(workflow.Actions) == 0 {
-		workflow.Actions = []Action{}
+		workflow.Actions = []model.Action{}
 	}
 	if len(workflow.Branches) == 0 {
-		workflow.Branches = []Branch{}
+		workflow.Branches = []model.Branch{}
 	}
 	if len(workflow.Triggers) == 0 {
-		workflow.Triggers = []Trigger{}
+		workflow.Triggers = []model.Trigger{}
 	}
 	if len(workflow.Errors) == 0 {
 		workflow.Errors = []string{}
@@ -2521,16 +2277,14 @@ func getSpecificWorkflow(resp http.ResponseWriter, request *http.Request) {
 //	return nil
 //}
 
-func setWorkflowExecution(ctx context.Context, workflowExecution WorkflowExecution) error {
+func setWorkflowExecution(workflowExecution model.WorkflowExecution) error {
 	if len(workflowExecution.ExecutionId) == 0 {
 		log.Printf("Workflowexeciton executionId can't be empty.")
 		return errors.New("ExecutionId can't be empty.")
 	}
 
-	key := datastore.NameKey("workflowexecution", workflowExecution.ExecutionId, nil)
-
 	// New struct, to not add body, author etc
-	if _, err := dbclient.Put(ctx, key, &workflowExecution); err != nil {
+	if err := dbClient.Save(&workflowExecution); err != nil {
 		log.Printf("Error adding workflow_execution: %s", err)
 		return err
 	}
@@ -2538,43 +2292,39 @@ func setWorkflowExecution(ctx context.Context, workflowExecution WorkflowExecuti
 	return nil
 }
 
-func getWorkflowExecution(ctx context.Context, id string) (*WorkflowExecution, error) {
-	key := datastore.NameKey("workflowexecution", strings.ToLower(id), nil)
-	workflowExecution := &WorkflowExecution{}
-	if err := dbclient.Get(ctx, key, workflowExecution); err != nil {
-		return &WorkflowExecution{}, err
+func getWorkflowExecution(id string) (*model.WorkflowExecution, error) {
+	workflowExecution := &model.WorkflowExecution{}
+	if err := dbClient.One("ExecutionId", id, workflowExecution); err != nil {
+		return &model.WorkflowExecution{}, err
 	}
 
 	return workflowExecution, nil
 }
 
-func getApp(ctx context.Context, id string) (*WorkflowApp, error) {
-	key := datastore.NameKey("workflowapp", strings.ToLower(id), nil)
-	workflowApp := &WorkflowApp{}
-	if err := dbclient.Get(ctx, key, workflowApp); err != nil {
-		return &WorkflowApp{}, err
+func getApp(id string) (*model.WorkflowApp, error) {
+	workflowApp := &model.WorkflowApp{}
+	if err := dbClient.One("ID", id, workflowApp); err != nil {
+		return &model.WorkflowApp{}, err
 	}
 
 	return workflowApp, nil
 }
 
-func getWorkflow(ctx context.Context, id string) (*Workflow, error) {
-	key := datastore.NameKey("workflow", strings.ToLower(id), nil)
-	workflow := &Workflow{}
-	if err := dbclient.Get(ctx, key, workflow); err != nil {
-		return &Workflow{}, err
+func getWorkflow(id string) (*model.Workflow, error) {
+	workflow := &model.Workflow{}
+	if err := dbClient.One("ID",id, workflow); err != nil {
+		return &model.Workflow{}, err
 	}
 
 	return workflow, nil
 }
 
-func getAllWorkflows(ctx context.Context) ([]Workflow, error) {
-	var allworkflows []Workflow
-	q := datastore.NewQuery("workflow")
+func getAllWorkflows() ([]model.Workflow, error) {
+	var allworkflows []model.Workflow
 
-	_, err := dbclient.GetAll(ctx, q, &allworkflows)
+	err := dbClient.All(&allworkflows)
 	if err != nil {
-		return []Workflow{}, err
+		return []model.Workflow{}, err
 	}
 
 	return allworkflows, nil
@@ -2582,11 +2332,10 @@ func getAllWorkflows(ctx context.Context) ([]Workflow, error) {
 
 // Hmm, so I guess this should use uuid :(
 // Consistency PLX
-func setWorkflow(ctx context.Context, workflow Workflow, id string) error {
-	key := datastore.NameKey("workflow", id, nil)
-
+func setWorkflow(workflow model.Workflow, id string) error {
+	workflow.ID = id
 	// New struct, to not add body, author etc
-	if _, err := dbclient.Put(ctx, key, &workflow); err != nil {
+	if err := dbClient.Save(&workflow); err != nil {
 		log.Printf("Error adding workflow: %s", err)
 		return err
 	}
@@ -2621,9 +2370,8 @@ func deleteWorkflowApp(resp http.ResponseWriter, request *http.Request) {
 		fileId = location[4]
 	}
 
-	ctx := context.Background()
 	log.Printf("ID: %s", fileId)
-	app, err := getApp(ctx, fileId)
+	app, err := getApp(fileId)
 	if err != nil {
 		log.Printf("Error getting app %s: %s", app.Name, err)
 		resp.WriteHeader(401)
@@ -2648,7 +2396,7 @@ func deleteWorkflowApp(resp http.ResponseWriter, request *http.Request) {
 	// Not really deleting it, just removing from user cache
 	if private {
 		log.Printf("Deleting private app")
-		var privateApps []WorkflowApp
+		var privateApps []model.WorkflowApp
 		for _, item := range user.PrivateApps {
 			log.Println(item.ID, fileId)
 			if item.ID == fileId {
@@ -2659,7 +2407,7 @@ func deleteWorkflowApp(resp http.ResponseWriter, request *http.Request) {
 		}
 
 		user.PrivateApps = privateApps
-		err = setUser(ctx, &user)
+		err = setUser(&user)
 		if err != nil {
 			log.Printf("Failed removing %s app for user %s: %s", app.Name, user.Username, err)
 			resp.WriteHeader(401)
@@ -2668,7 +2416,14 @@ func deleteWorkflowApp(resp http.ResponseWriter, request *http.Request) {
 		}
 	} else {
 		log.Printf("Deleting public app")
-		err = DeleteKey(ctx, "workflowapp", fileId)
+		app, err := getApp(fileId)
+		if err != nil {
+			log.Printf("Failed getting workflowapp")
+			resp.WriteHeader(401)
+			resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Failed getting workflow app"}`)))
+			return
+		}
+		err = dbClient.DeleteStruct(app)
 		if err != nil {
 			log.Printf("Failed deleting workflowapp")
 			resp.WriteHeader(401)
@@ -2677,7 +2432,7 @@ func deleteWorkflowApp(resp http.ResponseWriter, request *http.Request) {
 		}
 	}
 
-	err = increaseStatisticsField(ctx, "total_apps_deleted", fileId, 1)
+	err = increaseStatisticsField("total_apps_deleted", fileId, 1)
 	if err != nil {
 		log.Printf("Failed to increase total apps loaded stats: %s", err)
 	}
@@ -2713,8 +2468,7 @@ func getWorkflowAppConfig(resp http.ResponseWriter, request *http.Request) {
 		fileId = location[4]
 	}
 
-	ctx := context.Background()
-	app, err := getApp(ctx, fileId)
+	app, err := getApp(fileId)
 	if err != nil {
 		log.Printf("Error getting app: %s", app.Name)
 		resp.WriteHeader(401)
@@ -2729,7 +2483,7 @@ func getWorkflowAppConfig(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	parsedApi, err := getOpenApiDatastore(ctx, fileId)
+	parsedApi, err := getOpenApiDatastore(fileId)
 	if err != nil {
 		resp.WriteHeader(401)
 		resp.Write([]byte(`{"success": false}`))
@@ -2757,7 +2511,6 @@ func getWorkflowApps(resp http.ResponseWriter, request *http.Request) {
 	// FIXME - set this to be per user IF logged in, as there might exist private and public
 	//memcacheName := "all_apps"
 
-	ctx := context.Background()
 	// Just need to be logged in
 	// FIXME - need to be logged in?
 	user, userErr := handleApiAuthentication(resp, request)
@@ -2796,7 +2549,7 @@ func getWorkflowApps(resp http.ResponseWriter, request *http.Request) {
 	//	return
 	//}
 
-	workflowapps, err := getAllWorkflowApps(ctx)
+	workflowapps, err := getAllWorkflowApps()
 	if err != nil {
 		log.Printf("Failed getting apps: %s", err)
 		resp.WriteHeader(401)
@@ -2806,8 +2559,8 @@ func getWorkflowApps(resp http.ResponseWriter, request *http.Request) {
 	//log.Printf("Length: %d", len(workflowapps))
 
 	// FIXME - this is really garbage, but is here to protect again null values etc.
-	newapps := []WorkflowApp{}
-	baseApps := []WorkflowApp{}
+	newapps := []model.WorkflowApp{}
+	baseApps := []model.WorkflowApp{}
 
 	if len(user.PrivateApps) > 0 {
 		newapps = append(newapps, user.PrivateApps...)
@@ -2819,11 +2572,11 @@ func getWorkflowApps(resp http.ResponseWriter, request *http.Request) {
 		}
 
 		//workflowapp.Environment = "cloud"
-		newactions := []WorkflowAppAction{}
+		newactions := []model.WorkflowAppAction{}
 		for _, action := range workflowapp.Actions {
 			//action.Environment = workflowapp.Environment
 			if len(action.Parameters) == 0 {
-				action.Parameters = []WorkflowAppActionParameter{}
+				action.Parameters = []model.WorkflowAppActionParameter{}
 			}
 
 			newactions = append(newactions, action)
@@ -2877,7 +2630,7 @@ func getWorkflowApps(resp http.ResponseWriter, request *http.Request) {
 
 // Bad check for workflowapps :)
 // FIXME - use tags and struct reflection
-func checkWorkflowApp(workflowApp WorkflowApp) error {
+func checkWorkflowApp(workflowApp model.WorkflowApp) error {
 	// Validate fields
 	if workflowApp.Name == "" {
 		return errors.New("App field name doesn't exist")
@@ -3226,7 +2979,7 @@ func iterateAppGithubFolders(fs billy.Filesystem, dir []os.FileInfo, extra strin
 					return err
 				}
 
-				var workflowapp WorkflowApp
+				var workflowapp model.WorkflowApp
 				err = gyaml.Unmarshal(readFile, &workflowapp)
 				if err != nil {
 					log.Printf("Failed api.yaml unmarshal: %s", err)
@@ -3237,8 +2990,7 @@ func iterateAppGithubFolders(fs billy.Filesystem, dir []os.FileInfo, extra strin
 				extraSplit := strings.Split(extra, "/")
 				appName := fmt.Sprintf("%s_%s", strings.ReplaceAll(extraSplit[0], " ", "-"), extraSplit[1])
 
-				ctx := context.Background()
-				allapps, err := getAllWorkflowApps(ctx)
+				allapps, err := getAllWorkflowApps()
 				if err != nil {
 					log.Printf("Failed getting apps to verify: %s", err)
 					return err
@@ -3269,18 +3021,18 @@ func iterateAppGithubFolders(fs billy.Filesystem, dir []os.FileInfo, extra strin
 				workflowapp.Sharing = true
 				workflowapp.Downloaded = true
 
-				err = setWorkflowAppDatastore(ctx, workflowapp, workflowapp.ID)
+				err = setWorkflowAppDatastore(workflowapp, workflowapp.ID)
 				if err != nil {
 					log.Printf("Failed setting workflowapp: %s", err)
 					return err
 				}
 
-				err = increaseStatisticsField(ctx, "total_apps_created", workflowapp.ID, 1)
+				err = increaseStatisticsField("total_apps_created", workflowapp.ID, 1)
 				if err != nil {
 					log.Printf("Failed to increase total apps created stats: %s", err)
 				}
 
-				err = increaseStatisticsField(ctx, "total_apps_loaded", workflowapp.ID, 1)
+				err = increaseStatisticsField("total_apps_loaded", workflowapp.ID, 1)
 				if err != nil {
 					log.Printf("Failed to increase total apps loaded stats: %s", err)
 				}
@@ -3319,7 +3071,7 @@ func setNewWorkflowApp(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	var workflowapp WorkflowApp
+	var workflowapp model.WorkflowApp
 	err = json.Unmarshal(body, &workflowapp)
 	if err != nil {
 		log.Printf("Failed unmarshaling: %s", err)
@@ -3328,8 +3080,7 @@ func setNewWorkflowApp(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	allapps, err := getAllWorkflowApps(ctx)
+	allapps, err := getAllWorkflowApps()
 	if err != nil {
 		log.Printf("Failed getting apps to verify: %s", err)
 		resp.WriteHeader(401)
@@ -3369,7 +3120,7 @@ func setNewWorkflowApp(resp http.ResponseWriter, request *http.Request) {
 	workflowapp.IsValid = true
 	workflowapp.Generated = false
 
-	err = setWorkflowAppDatastore(ctx, workflowapp, workflowapp.ID)
+	err = setWorkflowAppDatastore(workflowapp, workflowapp.ID)
 	if err != nil {
 		log.Printf("Failed setting workflowapp: %s", err)
 		resp.WriteHeader(401)
@@ -3418,8 +3169,7 @@ func getWorkflowExecutions(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	workflow, err := getWorkflow(ctx, fileId)
+	workflow, err := getWorkflow(fileId)
 	if err != nil {
 		log.Printf("Failed getting the workflow locally: %s", err)
 		resp.WriteHeader(401)
@@ -3436,9 +3186,8 @@ func getWorkflowExecutions(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	// Query for the specifci workflowId
-	q := datastore.NewQuery("workflowexecution").Filter("workflow_id =", fileId).Limit(50)
-	var workflowExecutions []WorkflowExecution
-	_, err = dbclient.GetAll(ctx, q, &workflowExecutions)
+	var workflowExecutions []model.WorkflowExecution
+	err = dbClient.Find("WorkflowId", fileId, &workflowExecutions, storm.Limit(50))
 	if err != nil {
 		log.Printf("Error getting workflowexec: %s", err)
 		resp.WriteHeader(401)
@@ -3463,25 +3212,23 @@ func getWorkflowExecutions(resp http.ResponseWriter, request *http.Request) {
 	resp.Write(newjson)
 }
 
-func getAllSchedules(ctx context.Context) ([]ScheduleOld, error) {
-	var schedules []ScheduleOld
-	q := datastore.NewQuery("schedules")
+func getAllSchedules() ([]model.ScheduleOld, error) {
+	var schedules []model.ScheduleOld
 
-	_, err := dbclient.GetAll(ctx, q, &schedules)
+	err := dbClient.All(&schedules)
 	if err != nil {
-		return []ScheduleOld{}, err
+		return []model.ScheduleOld{}, err
 	}
 
 	return schedules, nil
 }
 
-func getAllWorkflowApps(ctx context.Context) ([]WorkflowApp, error) {
-	var allworkflowapps []WorkflowApp
-	q := datastore.NewQuery("workflowapp")
+func getAllWorkflowApps() ([]model.WorkflowApp, error) {
+	var allworkflowapps []model.WorkflowApp
 
-	_, err := dbclient.GetAll(ctx, q, &allworkflowapps)
+	err := dbClient.All(&allworkflowapps)
 	if err != nil {
-		return []WorkflowApp{}, err
+		return []model.WorkflowApp{}, err
 	}
 
 	return allworkflowapps, nil
@@ -3489,11 +3236,10 @@ func getAllWorkflowApps(ctx context.Context) ([]WorkflowApp, error) {
 
 // Hmm, so I guess this should use uuid :(
 // Consistency PLX
-func setWorkflowAppDatastore(ctx context.Context, workflowapp WorkflowApp, id string) error {
-	key := datastore.NameKey("workflowapp", id, nil)
-
+func setWorkflowAppDatastore(workflowapp model.WorkflowApp, id string) error {
+	workflowapp.ID = id
 	// New struct, to not add body, author etc
-	if _, err := dbclient.Put(ctx, key, &workflowapp); err != nil {
+	if err := dbClient.Save(&workflowapp); err != nil {
 		log.Printf("Error adding workflow app: %s", err)
 		return err
 	}
@@ -3535,8 +3281,7 @@ func handleStopHook(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	hook, err := getHook(ctx, fileId)
+	hook, err := getHook(fileId)
 	if err != nil {
 		log.Printf("Failed getting hook: %s", err)
 		resp.WriteHeader(401)
@@ -3563,8 +3308,8 @@ func handleStopHook(resp http.ResponseWriter, request *http.Request) {
 
 	hook.Status = "stopped"
 	hook.Running = false
-	hook.Actions = []HookAction{}
-	err = setHook(ctx, *hook)
+	hook.Actions = []model.HookAction{}
+	err = setHook(*hook)
 	if err != nil {
 		log.Printf("Failed setting hook: %s", err)
 		resp.WriteHeader(401)
@@ -3576,7 +3321,7 @@ func handleStopHook(resp http.ResponseWriter, request *http.Request) {
 
 	// This is here to force stop and remove the old webhook
 	// FIXME
-	err = removeWebhookFunction(ctx, fileId)
+	err = removeWebhookFunction(fileId)
 	if err != nil {
 		log.Printf("Container stop issue for %s-%s: %s", image, fileId, err)
 	}
@@ -3618,8 +3363,7 @@ func handleDeleteHook(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	hook, err := getHook(ctx, fileId)
+	hook, err := getHook(fileId)
 	if err != nil {
 		log.Printf("Failed getting hook: %s", err)
 		resp.WriteHeader(401)
@@ -3635,14 +3379,14 @@ func handleDeleteHook(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	if len(hook.Workflows) > 0 {
-		err = increaseStatisticsField(ctx, "total_workflow_triggers", hook.Workflows[0], -1)
+		err = increaseStatisticsField("total_workflow_triggers", hook.Workflows[0], -1)
 		if err != nil {
 			log.Printf("Failed to increase total workflows: %s", err)
 		}
 	}
 
 	hook.Status = "stopped"
-	err = setHook(ctx, *hook)
+	err = setHook(*hook)
 	if err != nil {
 		log.Printf("Failed setting hook: %s", err)
 		resp.WriteHeader(401)
@@ -3672,7 +3416,9 @@ func handleDeleteHook(resp http.ResponseWriter, request *http.Request) {
 	resp.Write([]byte(`{"success": true, "reason": "Stopped webhook"}`))
 }
 
-func removeWebhookFunction(ctx context.Context, hookid string) error {
+func removeWebhookFunction(hookid string) error {
+	// TODO: GC: Webhook functions on prem
+	/*
 	service, err := cloudfunctions.NewService(ctx)
 	if err != nil {
 		return err
@@ -3693,6 +3439,8 @@ func removeWebhookFunction(ctx context.Context, hookid string) error {
 	}
 
 	_ = resp
+	return nil
+	*/
 	return nil
 }
 
@@ -3729,8 +3477,7 @@ func handleStartHook(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
-	hook, err := getHook(ctx, fileId)
+	hook, err := getHook(fileId)
 	if err != nil {
 		log.Printf("Failed getting hook: %s", err)
 		resp.WriteHeader(401)
@@ -3763,6 +3510,7 @@ func handleStartHook(resp http.ResponseWriter, request *http.Request) {
 
 	applocation := fmt.Sprintf("gs://%s/triggers/webhook.zip", bucketName)
 	hookname := fmt.Sprintf("webhook_%s", fileId)
+	ctx := context.Background()
 	err = deployWebhookFunction(ctx, hookname, "europe-west2", applocation, environmentVariables)
 	if err != nil {
 		resp.WriteHeader(401)
@@ -3772,7 +3520,7 @@ func handleStartHook(resp http.ResponseWriter, request *http.Request) {
 
 	hook.Status = "running"
 	hook.Running = true
-	err = setHook(ctx, *hook)
+	err = setHook(*hook)
 	if err != nil {
 		log.Printf("Failed setting hook: %s", err)
 		resp.WriteHeader(401)

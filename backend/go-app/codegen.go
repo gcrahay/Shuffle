@@ -10,9 +10,9 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"shuffle/model"
 	"strings"
 
-	"cloud.google.com/go/storage"
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/satori/go.uuid"
 	"gopkg.in/yaml.v2"
@@ -138,36 +138,6 @@ func getAppbase() ([]byte, []byte, error) {
 	return appbaseData, staticData, nil
 }
 
-// Builds the structure for the new generated app in storage (copying baseline files)
-func getAppbaseGCP(ctx context.Context, client *storage.Client) ([]byte, []byte, error) {
-	// 1. Have baseline in bucket/generated_apps/baseline
-	// 2. Copy the baseline to a new folder with identifier name
-	basePath := "generated_apps/baseline"
-	static, err := client.Bucket(bucketName).Object(fmt.Sprintf("%s/static_baseline.py", basePath)).NewReader(ctx)
-	if err != nil {
-		return []byte{}, []byte{}, err
-	}
-	appbase, err := client.Bucket(bucketName).Object(fmt.Sprintf("%s/app_base.py", basePath)).NewReader(ctx)
-	if err != nil {
-		return []byte{}, []byte{}, err
-	}
-
-	defer static.Close()
-	defer appbase.Close()
-
-	staticData, err := ioutil.ReadAll(static)
-	if err != nil {
-		return []byte{}, []byte{}, err
-	}
-
-	appbaseData, err := ioutil.ReadAll(appbase)
-	if err != nil {
-		return []byte{}, []byte{}, err
-	}
-
-	return appbaseData, staticData, nil
-}
-
 func fixAppbase(appbase []byte) []string {
 	record := false
 	validLines := []string{}
@@ -190,25 +160,6 @@ func fixAppbase(appbase []byte) []string {
 	return validLines
 }
 
-// Builds the structure for the new generated app in storage (copying baseline files)
-func buildStructureGCP(ctx context.Context, client *storage.Client, swagger *openapi3.Swagger, curHash string) (string, error) {
-	// 1. Have baseline in bucket/generated_apps/baseline
-	// 2. Copy the baseline to a new folder with identifier name
-
-	basePath := "generated_apps"
-	identifier := fmt.Sprintf("%s-%s", swagger.Info.Title, curHash)
-	appPath := fmt.Sprintf("%s/%s", basePath, identifier)
-	fileNames := []string{"Dockerfile", "requirements.txt"}
-	for _, file := range fileNames {
-		src := client.Bucket(bucketName).Object(fmt.Sprintf("%s/baseline/%s", basePath, file))
-		dst := client.Bucket(bucketName).Object(fmt.Sprintf("%s/%s", appPath, file))
-		if _, err := dst.CopierFrom(src).Run(ctx); err != nil {
-			return "", err
-		}
-	}
-
-	return appPath, nil
-}
 
 // Builds the base structure for the app that we're making
 // Returns error if anything goes wrong. This has to work if
@@ -331,16 +282,16 @@ func makePythoncode(swagger *openapi3.Swagger, name, url, method string, paramet
 	return functionname, data
 }
 
-func generateYaml(swagger *openapi3.Swagger, newmd5 string) (WorkflowApp, []string, error) {
-	api := WorkflowApp{}
+func generateYaml(swagger *openapi3.Swagger, newmd5 string) (model.WorkflowApp, []string, error) {
+	api := model.WorkflowApp{}
 	//log.Printf("%#v", swagger.Info)
 
 	if len(swagger.Info.Title) == 0 {
-		return WorkflowApp{}, []string{}, errors.New("Swagger.Info.Title can't be empty.")
+		return model.WorkflowApp{}, []string{}, errors.New("Swagger.Info.Title can't be empty.")
 	}
 
 	if len(swagger.Servers) == 0 {
-		return WorkflowApp{}, []string{}, errors.New("Swagger.Servers can't be empty. Add 'servers':[{'url':'hostname.com'}'")
+		return model.WorkflowApp{}, []string{}, errors.New("Swagger.Servers can't be empty. Add 'servers':[{'url':'hostname.com'}'")
 	}
 
 	api.Name = swagger.Info.Title
@@ -362,16 +313,16 @@ func generateYaml(swagger *openapi3.Swagger, newmd5 string) (WorkflowApp, []stri
 	api.PrivateID = newmd5
 	api.Generated = true
 	// Setting up security schemes
-	extraParameters := []WorkflowAppActionParameter{}
+	extraParameters := []model.WorkflowAppActionParameter{}
 
 	securitySchemes := swagger.Components.SecuritySchemes
 	if securitySchemes != nil {
 		log.Printf("%#v", securitySchemes)
 
-		api.Authentication = Authentication{
+		api.Authentication = model.Authentication{
 			Required: true,
-			Parameters: []AuthenticationParams{
-				AuthenticationParams{
+			Parameters: []model.AuthenticationParams{
+				model.AuthenticationParams{
 					Multiline: false,
 					Required:  true,
 				},
@@ -387,12 +338,12 @@ func generateYaml(swagger *openapi3.Swagger, newmd5 string) (WorkflowApp, []stri
 			api.Authentication.Parameters[0].In = securitySchemes["BearerAuth"].Value.In
 			api.Authentication.Parameters[0].Scheme = securitySchemes["BearerAuth"].Value.Scheme
 			log.Printf("HANDLE BEARER AUTH")
-			extraParameters = append(extraParameters, WorkflowAppActionParameter{
+			extraParameters = append(extraParameters, model.WorkflowAppActionParameter{
 				Name:        "apikey",
 				Description: "The apikey to use",
 				Multiline:   false,
 				Required:    true,
-				Schema: SchemaDefinition{
+				Schema: model.SchemaDefinition{
 					Type: "string",
 				},
 			})
@@ -403,12 +354,12 @@ func generateYaml(swagger *openapi3.Swagger, newmd5 string) (WorkflowApp, []stri
 			api.Authentication.Parameters[0].In = securitySchemes["ApiKeyAuth"].Value.In
 			api.Authentication.Parameters[0].Scheme = securitySchemes["ApiKeyAuth"].Value.Scheme
 			log.Printf("HANDLE APIKEY AUTH")
-			extraParameters = append(extraParameters, WorkflowAppActionParameter{
+			extraParameters = append(extraParameters, model.WorkflowAppActionParameter{
 				Name:        "apikey",
 				Description: "The apikey to use",
 				Multiline:   false,
 				Required:    true,
-				Schema: SchemaDefinition{
+				Schema: model.SchemaDefinition{
 					Type: "string",
 				},
 			})
@@ -418,21 +369,21 @@ func generateYaml(swagger *openapi3.Swagger, newmd5 string) (WorkflowApp, []stri
 			api.Authentication.Parameters[0].Name = securitySchemes["BasicAuth"].Value.Name
 			api.Authentication.Parameters[0].In = securitySchemes["BasicAuth"].Value.In
 			api.Authentication.Parameters[0].Scheme = securitySchemes["BasicAuth"].Value.Scheme
-			extraParameters = append(extraParameters, WorkflowAppActionParameter{
+			extraParameters = append(extraParameters, model.WorkflowAppActionParameter{
 				Name:        "username",
 				Description: "The username to use",
 				Multiline:   false,
 				Required:    true,
-				Schema: SchemaDefinition{
+				Schema: model.SchemaDefinition{
 					Type: "string",
 				},
 			})
-			extraParameters = append(extraParameters, WorkflowAppActionParameter{
+			extraParameters = append(extraParameters, model.WorkflowAppActionParameter{
 				Name:        "password",
 				Description: "The password to use",
 				Multiline:   false,
 				Required:    true,
-				Schema: SchemaDefinition{
+				Schema: model.SchemaDefinition{
 					Type: "string",
 				},
 			})
@@ -441,12 +392,12 @@ func generateYaml(swagger *openapi3.Swagger, newmd5 string) (WorkflowApp, []stri
 
 	// Adds a link parameter if it's not already defined
 	if len(api.Link) == 0 {
-		extraParameters = append(extraParameters, WorkflowAppActionParameter{
+		extraParameters = append(extraParameters, model.WorkflowAppActionParameter{
 			Name:        "url",
 			Description: "The URL of the app",
 			Multiline:   false,
 			Required:    true,
-			Schema: SchemaDefinition{
+			Schema: model.SchemaDefinition{
 				Type: "string",
 			},
 		})
@@ -505,7 +456,7 @@ func generateYaml(swagger *openapi3.Swagger, newmd5 string) (WorkflowApp, []stri
 }
 
 // FIXME - have this give a real version?
-func verifyApi(api WorkflowApp) WorkflowApp {
+func verifyApi(api model.WorkflowApp) model.WorkflowApp {
 	if api.AppVersion == "" {
 		api.AppVersion = "1.0.0"
 	}
@@ -542,23 +493,6 @@ if __name__ == "__main__":
 	return baseString
 }
 
-func dumpPythonGCP(ctx context.Context, client *storage.Client, basePath, name, version string, pythonFunctions []string) (string, error) {
-	parsedCode := fmt.Sprintf(getBasePython(), name, version, name, strings.Join(pythonFunctions, "\n"), name)
-
-	// Create bucket handle
-	bucket := client.Bucket(bucketName)
-	obj := bucket.Object(fmt.Sprintf("%s/src/app.py", basePath))
-	w := obj.NewWriter(ctx)
-	if _, err := fmt.Fprintf(w, parsedCode); err != nil {
-		return "", err
-	}
-	// Close, just like writing a file.
-	if err := w.Close(); err != nil {
-		return "", err
-	}
-
-	return parsedCode, nil
-}
 
 func dumpPython(basePath, name, version string, pythonFunctions []string) (string, error) {
 	//log.Printf("%#v", api)
@@ -575,47 +509,8 @@ func dumpPython(basePath, name, version string, pythonFunctions []string) (strin
 	return parsedCode, nil
 }
 
-func dumpApiGCP(ctx context.Context, client *storage.Client, swagger *openapi3.Swagger, basePath string, api WorkflowApp) error {
-	//log.Printf("%#v", api)
-	data, err := yaml.Marshal(api)
-	if err != nil {
-		log.Printf("Error with yaml marshal: %s", err)
-		return err
-	}
 
-	// Create bucket handle
-	bucket := client.Bucket(bucketName)
-	obj := bucket.Object(fmt.Sprintf("%s/app.yaml", basePath))
-	w := obj.NewWriter(ctx)
-	if _, err := fmt.Fprintln(w, string(data)); err != nil {
-		return err
-	}
-	// Close, just like writing a file.
-	if err := w.Close(); err != nil {
-		return err
-	}
-
-	openapidata, err := yaml.Marshal(swagger)
-	if err != nil {
-		log.Printf("Error with yaml marshal: %s", err)
-		return err
-	}
-	obj = bucket.Object(fmt.Sprintf("%s/openapi.yaml", basePath))
-	//log.Println(string(openapidata))
-	w = obj.NewWriter(ctx)
-	if _, err := fmt.Fprintln(w, string(openapidata)); err != nil {
-		return err
-	}
-	// Close, just like writing a file.
-	if err := w.Close(); err != nil {
-		return err
-	}
-
-	//log.Println(string(data))
-	return nil
-}
-
-func dumpApi(basePath string, api WorkflowApp) error {
+func dumpApi(basePath string, api model.WorkflowApp) error {
 	//log.Printf("%#v", api)
 	data, err := yaml.Marshal(api)
 	if err != nil {
@@ -651,8 +546,8 @@ def run(request):
 	`, classname)
 }
 
-func deployAppToDatastore(ctx context.Context, workflowapp WorkflowApp) error {
-	err := setWorkflowAppDatastore(ctx, workflowapp, workflowapp.ID)
+func deployAppToDatastore(ctx context.Context, workflowapp model.WorkflowApp) error {
+	err := setWorkflowAppDatastore(workflowapp, workflowapp.ID)
 	if err != nil {
 		log.Printf("Failed setting workflowapp: %s", err)
 		return err
@@ -678,11 +573,11 @@ func fixFunctionName(functionName, actualPath string) string {
 	return functionName
 }
 
-func handleConnect(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (WorkflowAppAction, string) {
+func handleConnect(swagger *openapi3.Swagger, api model.WorkflowApp, extraParameters []model.WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (model.WorkflowAppAction, string) {
 	// What to do with this, hmm
 	functionName := fixFunctionName(path.Connect.Summary, actualPath)
 
-	action := WorkflowAppAction{
+	action := model.WorkflowAppAction{
 		Description: path.Connect.Description,
 		Name:        fmt.Sprintf("%s %s", "Connect", path.Connect.Summary),
 		Label:       fmt.Sprintf(path.Connect.Summary),
@@ -701,15 +596,15 @@ func handleConnect(swagger *openapi3.Swagger, api WorkflowApp, extraParameters [
 	firstQuery = true
 	optionalQueries := []string{}
 	parameters := []string{}
-	optionalParameters := []WorkflowAppActionParameter{}
+	optionalParameters := []model.WorkflowAppActionParameter{}
 	if len(path.Connect.Parameters) > 0 {
 		for _, param := range path.Connect.Parameters {
-			curParam := WorkflowAppActionParameter{
+			curParam := model.WorkflowAppActionParameter{
 				Name:        param.Value.Name,
 				Description: param.Value.Description,
 				Multiline:   false,
 				Required:    param.Value.Required,
-				Schema: SchemaDefinition{
+				Schema: model.SchemaDefinition{
 					Type: param.Value.Schema.Value.Type,
 				},
 			}
@@ -760,11 +655,11 @@ func handleConnect(swagger *openapi3.Swagger, api WorkflowApp, extraParameters [
 	return action, curCode
 }
 
-func handleGet(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (WorkflowAppAction, string) {
+func handleGet(swagger *openapi3.Swagger, api model.WorkflowApp, extraParameters []model.WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (model.WorkflowAppAction, string) {
 	// What to do with this, hmm
 	functionName := fixFunctionName(path.Get.Summary, actualPath)
 
-	action := WorkflowAppAction{
+	action := model.WorkflowAppAction{
 		Description: path.Get.Description,
 		Name:        fmt.Sprintf("%s %s", "Get", path.Get.Summary),
 		Label:       fmt.Sprintf(path.Get.Summary),
@@ -788,15 +683,15 @@ func handleGet(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []Wor
 	// FIXME - remove this when authentication is properly introduced
 	parameters := []string{}
 
-	optionalParameters := []WorkflowAppActionParameter{}
+	optionalParameters := []model.WorkflowAppActionParameter{}
 	if len(path.Get.Parameters) > 0 {
 		for _, param := range path.Get.Parameters {
-			curParam := WorkflowAppActionParameter{
+			curParam := model.WorkflowAppActionParameter{
 				Name:        param.Value.Name,
 				Description: param.Value.Description,
 				Multiline:   false,
 				Required:    param.Value.Required,
-				Schema: SchemaDefinition{
+				Schema: model.SchemaDefinition{
 					Type: param.Value.Schema.Value.Type,
 				},
 			}
@@ -847,11 +742,11 @@ func handleGet(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []Wor
 	return action, curCode
 }
 
-func handleHead(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (WorkflowAppAction, string) {
+func handleHead(swagger *openapi3.Swagger, api model.WorkflowApp, extraParameters []model.WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (model.WorkflowAppAction, string) {
 	// What to do with this, hmm
 	functionName := fixFunctionName(path.Head.Summary, actualPath)
 
-	action := WorkflowAppAction{
+	action := model.WorkflowAppAction{
 		Description: path.Head.Description,
 		Name:        fmt.Sprintf("%s %s", "Head", path.Head.Summary),
 		Label:       fmt.Sprintf(path.Head.Summary),
@@ -870,15 +765,15 @@ func handleHead(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []Wo
 	firstQuery = true
 	optionalQueries := []string{}
 	parameters := []string{}
-	optionalParameters := []WorkflowAppActionParameter{}
+	optionalParameters := []model.WorkflowAppActionParameter{}
 	if len(path.Head.Parameters) > 0 {
 		for _, param := range path.Head.Parameters {
-			curParam := WorkflowAppActionParameter{
+			curParam := model.WorkflowAppActionParameter{
 				Name:        param.Value.Name,
 				Description: param.Value.Description,
 				Multiline:   false,
 				Required:    param.Value.Required,
-				Schema: SchemaDefinition{
+				Schema: model.SchemaDefinition{
 					Type: param.Value.Schema.Value.Type,
 				},
 			}
@@ -929,11 +824,11 @@ func handleHead(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []Wo
 	return action, curCode
 }
 
-func handleDelete(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (WorkflowAppAction, string) {
+func handleDelete(swagger *openapi3.Swagger, api model.WorkflowApp, extraParameters []model.WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (model.WorkflowAppAction, string) {
 	// What to do with this, hmm
 	functionName := fixFunctionName(path.Delete.Summary, actualPath)
 
-	action := WorkflowAppAction{
+	action := model.WorkflowAppAction{
 		Description: path.Delete.Description,
 		Name:        fmt.Sprintf("%s %s", "Delete", path.Delete.Summary),
 		Label:       fmt.Sprintf(path.Delete.Summary),
@@ -952,15 +847,15 @@ func handleDelete(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []
 	firstQuery = true
 	optionalQueries := []string{}
 	parameters := []string{}
-	optionalParameters := []WorkflowAppActionParameter{}
+	optionalParameters := []model.WorkflowAppActionParameter{}
 	if len(path.Delete.Parameters) > 0 {
 		for _, param := range path.Delete.Parameters {
-			curParam := WorkflowAppActionParameter{
+			curParam := model.WorkflowAppActionParameter{
 				Name:        param.Value.Name,
 				Description: param.Value.Description,
 				Multiline:   false,
 				Required:    param.Value.Required,
-				Schema: SchemaDefinition{
+				Schema: model.SchemaDefinition{
 					Type: param.Value.Schema.Value.Type,
 				},
 			}
@@ -1011,12 +906,12 @@ func handleDelete(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []
 	return action, curCode
 }
 
-func handlePost(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (WorkflowAppAction, string) {
+func handlePost(swagger *openapi3.Swagger, api model.WorkflowApp, extraParameters []model.WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (model.WorkflowAppAction, string) {
 	// What to do with this, hmm
 	log.Printf("PATH: %s", actualPath)
 	functionName := fixFunctionName(path.Post.Summary, actualPath)
 
-	action := WorkflowAppAction{
+	action := model.WorkflowAppAction{
 		Description: path.Post.Description,
 		Name:        fmt.Sprintf("%s %s", "Post", path.Post.Summary),
 		Label:       fmt.Sprintf(path.Post.Summary),
@@ -1035,26 +930,26 @@ func handlePost(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []Wo
 	firstQuery = true
 	optionalQueries := []string{}
 	parameters := []string{}
-	optionalParameters := []WorkflowAppActionParameter{
-		WorkflowAppActionParameter{
+	optionalParameters := []model.WorkflowAppActionParameter{
+		model.WorkflowAppActionParameter{
 			Name:        "body",
 			Description: "The body to use",
 			Multiline:   true,
 			Required:    false,
 			Example:     `{"username": "test"}`,
-			Schema: SchemaDefinition{
+			Schema: model.SchemaDefinition{
 				Type: "string",
 			},
 		},
 	}
 	if len(path.Post.Parameters) > 0 {
 		for _, param := range path.Post.Parameters {
-			curParam := WorkflowAppActionParameter{
+			curParam := model.WorkflowAppActionParameter{
 				Name:        param.Value.Name,
 				Description: param.Value.Description,
 				Multiline:   false,
 				Required:    param.Value.Required,
-				Schema: SchemaDefinition{
+				Schema: model.SchemaDefinition{
 					Type: param.Value.Schema.Value.Type,
 				},
 			}
@@ -1105,11 +1000,11 @@ func handlePost(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []Wo
 	return action, curCode
 }
 
-func handlePatch(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (WorkflowAppAction, string) {
+func handlePatch(swagger *openapi3.Swagger, api model.WorkflowApp, extraParameters []model.WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (model.WorkflowAppAction, string) {
 	// What to do with this, hmm
 	functionName := fixFunctionName(path.Patch.Summary, actualPath)
 
-	action := WorkflowAppAction{
+	action := model.WorkflowAppAction{
 		Description: path.Patch.Description,
 		Name:        fmt.Sprintf("%s %s", "Patch", path.Patch.Summary),
 		Label:       fmt.Sprintf(path.Patch.Summary),
@@ -1128,26 +1023,26 @@ func handlePatch(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []W
 	firstQuery = true
 	optionalQueries := []string{}
 	parameters := []string{}
-	optionalParameters := []WorkflowAppActionParameter{
-		WorkflowAppActionParameter{
+	optionalParameters := []model.WorkflowAppActionParameter{
+		model.WorkflowAppActionParameter{
 			Name:        "body",
 			Description: "The body to use",
 			Multiline:   true,
 			Required:    false,
 			Example:     `{"username": "test"}`,
-			Schema: SchemaDefinition{
+			Schema: model.SchemaDefinition{
 				Type: "string",
 			},
 		},
 	}
 	if len(path.Patch.Parameters) > 0 {
 		for _, param := range path.Patch.Parameters {
-			curParam := WorkflowAppActionParameter{
+			curParam := model.WorkflowAppActionParameter{
 				Name:        param.Value.Name,
 				Description: param.Value.Description,
 				Multiline:   false,
 				Required:    param.Value.Required,
-				Schema: SchemaDefinition{
+				Schema: model.SchemaDefinition{
 					Type: param.Value.Schema.Value.Type,
 				},
 			}
@@ -1198,11 +1093,11 @@ func handlePatch(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []W
 	return action, curCode
 }
 
-func handlePut(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (WorkflowAppAction, string) {
+func handlePut(swagger *openapi3.Swagger, api model.WorkflowApp, extraParameters []model.WorkflowAppActionParameter, path *openapi3.PathItem, actualPath string, firstQuery bool) (model.WorkflowAppAction, string) {
 	// What to do with this, hmm
 	functionName := fixFunctionName(path.Put.Summary, actualPath)
 
-	action := WorkflowAppAction{
+	action := model.WorkflowAppAction{
 		Description: path.Put.Description,
 		Name:        fmt.Sprintf("%s %s", "Put", path.Put.Summary),
 		Label:       fmt.Sprintf(path.Put.Summary),
@@ -1221,26 +1116,26 @@ func handlePut(swagger *openapi3.Swagger, api WorkflowApp, extraParameters []Wor
 	firstQuery = true
 	optionalQueries := []string{}
 	parameters := []string{}
-	optionalParameters := []WorkflowAppActionParameter{
-		WorkflowAppActionParameter{
+	optionalParameters := []model.WorkflowAppActionParameter{
+		model.WorkflowAppActionParameter{
 			Name:        "body",
 			Description: "The body to use",
 			Multiline:   true,
 			Required:    false,
 			Example:     `{"username": "test"}`,
-			Schema: SchemaDefinition{
+			Schema: model.SchemaDefinition{
 				Type: "string",
 			},
 		},
 	}
 	if len(path.Put.Parameters) > 0 {
 		for _, param := range path.Put.Parameters {
-			curParam := WorkflowAppActionParameter{
+			curParam := model.WorkflowAppActionParameter{
 				Name:        param.Value.Name,
 				Description: param.Value.Description,
 				Multiline:   false,
 				Required:    param.Value.Required,
-				Schema: SchemaDefinition{
+				Schema: model.SchemaDefinition{
 					Type: param.Value.Schema.Value.Type,
 				},
 			}
