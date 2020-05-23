@@ -12,20 +12,8 @@ services:
     networks:
       - shuffle
     restart: unless-stopped
-  database:
-    build: ./backend/database
-    image: frikky/shuffle:database
-    container_name: shuffle-database
-    hostname: shuffle-database
-    ports:
-      - "8000:8000"
-    networks:
-      - shuffle
-    restart: unless-stopped
-    volumes:
-      - /etc/shuffle:/etc/shuffle
   backend:
-    build: ./backend
+    build: ./services
     image: frikky/shuffle:backend
     container_name: shuffle-backend
     hostname: ${BACKEND_HOSTNAME}
@@ -34,17 +22,18 @@ services:
     networks:
       - shuffle
     volumes: 
-      - /var/run/docker.sock:/var/run/docker.sock 
-    environment: 
-      - ORG_ID=${ORG_ID}
-      - DATASTORE_EMULATOR_HOST=shuffle-database:8000
-      - BACKEND_PORT=${BACKEND_PORT}
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/database/
+    environment:
+      - SHUFFLE_COMMAND=backend
+      - SHUFFLE_PORT=${BACKEND_PORT}
+      - SHUFFLE_DATABASE=/database/shuffle.db
     restart: unless-stopped
     depends_on:
       - database
       - frontend
   orborus:
-    build: ./functions/onprem/orborus
+    build: ./services
     image: frikky/shuffle:orborus
     container_name: shuffle-orborus
     hostname: shuffle-orborus
@@ -53,16 +42,19 @@ services:
     volumes: 
       - /var/run/docker.sock:/var/run/docker.sock 
     environment:
-      - ORG_ID=${ORG_ID}
-      - ENVIRONMENT_NAME=${ENVIRONMENT_NAME}
-      - BASE_URL=http://${OUTER_HOSTNAME}:${BACKEND_PORT}
+      - SHUFFLE_COMMAND=orborus
+      - SHUFFLE_ORGANIZATION=${ORG_ID}
+      - SHUFFLE_ENVIRONMENT=${ENVIRONMENT_NAME}
+      - SHUFFLE_SERVER=http://${OUTER_HOSTNAME}:${BACKEND_PORT}
     restart: unless-stopped
   app_sdk:
     build: ./functions/onprem/app_sdk
     image: frikky/shuffle:app_sdk
   worker:
-    build: ./functions/onprem/worker
+    build: ./services
     image: frikky/shuffle:worker
+    environment:
+      - SHUFFLE_COMMAND=worker
 networks:
   shuffle:
     driver: bridge
